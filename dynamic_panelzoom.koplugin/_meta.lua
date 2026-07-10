@@ -1,7 +1,7 @@
 return {
     name = "dynamic_panelzoom.koplugin",
-    fullname = "Dynamic Panel Zoom",
+    fullname = "Advanced Panel Zoom Plugin",
     description = "Enhanced comic reading with dynamic, real-time panel detection and navigation",
     author = "KOReader Community",
-    version = "1.7.0",
+    version = "2.0.0",
 }

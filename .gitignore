@@ -23,10 +23,28 @@ metadata.*.lua
 
 # Build artifacts
 *.zip
+*.7z
 *.tar.gz
+*.tmp
+*.pgm
+*.ppm
+*.panels.json
 local_resources/
 openspec/
+crash.log
+*.log
+panelzoom.log
+panelzoom_dump.log
+_tmp_pz_previews/
+test/.venv/
+test/__pycache__/
+dynamic_panelzoom.koplugin/test/.venv/
+dynamic_panelzoom.koplugin/test/__pycache__/
+dynamic_panelzoom.koplugin/test/fixtures/
+__pycache__/
+*.pyc
 
 # Markdown files except README
 *.md
 !README.md
+!dynamic_panelzoom.koplugin/README.md

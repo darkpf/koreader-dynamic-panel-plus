@@ -1,16 +1,38 @@
 local Device = require("device")
-local Dispatcher = require("dispatcher")
+local Event = require("ui/event")
+local Blitbuffer = require("ffi/blitbuffer")
 local Geom = require("ui/geometry")
-local GestureRange = require("ui/gesturerange")
 local InfoMessage = require("ui/widget/infomessage")
-local Screen = require("device").screen
+local Screen = Device.screen
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local PanelViewer = require("panel_viewer")
+local PanelDetect = require("panel_detect")
 local _ = require("gettext")
 local logger = require("logger")
-local util = require("util")
-local json = require("json")
+
+-- Long side of the downscaled render used for panel analysis.
+-- Keep in sync with ANALYSIS_PX in test/run_tests.py.
+local ANALYSIS_TARGET_PX = 1300
+local PANEL_CLEAR_REFRESH_MODE = "flashui"
+local PANEL_DRAW_REFRESH_MODE = "ui"
+local PANEL_CLEAR_EPDC_SLEEP_US = 0
+local PANEL_CLEAR_LUMA = 128
+local PANEL_FORCE_DRAW_REPAINT = false
+local PANEL_DIRECT_CLEAR = true
+local PANEL_FULL_SCREEN_TRANSITION = true
+local PANEL_SINGLE_FULL_DRAW = false
+
+local READER_DEFAULTS = {
+    rotation_mode = Screen.DEVICE_ROTATED_COUNTER_CLOCKWISE,
+    trim_page = 3, -- Page crop: none
+    zoom_mode = "page", -- Page fit: full
+    zoom_mode_genus = 4, -- page
+    zoom_mode_type = 2, -- full
+    page_scroll = 0, -- View mode: page
+    contrast = 2.0,
+    dithering = 1,
+}
 
 local PanelZoomIntegration = WidgetContainer:extend{
     name = "dynamic_panelzoom",
@@ -23,6 +45,7 @@ local PanelZoomIntegration = WidgetContainer:extend{
     _panel_cache = {}, -- Cache JSON per document
     _preloaded_image = nil, -- Pre-rendered next panel
     _preloaded_panel_index = nil, -- Index of preloaded panel
+    _preloaded_panel_screen_rect = nil,
     _is_switching = false, -- Debounce guard to prevent fast tap issues
     _is_changing_page = false, -- True while a page change is in progress
     _page_change_diff = nil, -- Direction of current page change (+1 or -1)
@@ -30,20 +53,36 @@ local PanelZoomIntegration = WidgetContainer:extend{
     _original_ocr_handler = nil, -- Store original OCR handler
     _original_ocr_menu_enabled = nil, -- Store original OCR menu state
     _original_genPanelZoomMenu = nil, -- Store original panel zoom menu function
+    _original_highlight_addToMainMenu = nil, -- Store original KOReader menu inserter
     _json_available = false, -- Track if JSON is available for current document
     reading_direction_override = nil, -- User override for reading direction (rtl/ltr)
-    zoom_margin_percent = 0.05, -- Default 5% extra margin for the free zoom mode
+    zoom_margin_percent = 0.02, -- Default 2% extra margin for the free zoom mode
     standard_margin_percent = 0.0, -- Default 0% extra margin for standard panel-by-panel navigation
     show_adjacent_panels = true,   -- Show adjacent content (Smart Fill)
-    zoom_initial_scale = 1.2, -- Default 1.2x initial software scale for the free zoom mode
+    -- Keep standard panel crops at the screen aspect. Lower values make the
+    -- crop tighter, but they also leave visible bands because the rendered
+    -- image no longer fills the screen.
+    smart_fill_strength = 1.0,
+    zoom_initial_scale = 2.0, -- Default 2.0x initial software scale for the free zoom mode
     panelzoom_tap_forward_zone = "auto", -- auto, left, or right
+    apply_koreader_defaults = true,
+    plugin_enabled = true,
+    hold_to_zoom_enabled = true,
 }
 
 function PanelZoomIntegration:init()
-    self.experimental_panel_sorting_enabled = false
+    -- Everything goes to crash.log (via KOReader's logger). We create NO
+    -- separate log files: crash.log survives restarts, so dumped diagnostics
+    -- cannot be lost, and there is a single file to hand over.
+    --
+    -- Debug output is opt-in. When enabled from the KOReader menu, both panel
+    -- logs and embedded PGM dumps go to crash.log; no sidecar files are used.
+    self.debug_log_panels = false
+    self.dump_analysis_pgm = false
 
-    -- Auto-detect JSON and integrate with Panel Zoom when document is opened
-    self.onDocumentLoaded = function()
+    -- ReaderReady is KOReader's real "document is loaded and rendered" event.
+    self.onReaderReady = function()
+        self:applyPreferredReaderDefaults()
         self:checkAndIntegratePanelZoom()
     end
     
@@ -56,6 +95,7 @@ function PanelZoomIntegration:init()
         if self._is_changing_page then
             self:_onPageChangeComplete(new_page_no)
         else
+            self:applyPreferredReaderDefaults()
             self:checkAndIntegratePanelZoom()
         end
     end
@@ -81,12 +121,123 @@ function PanelZoomIntegration:getEffectiveReadingDirection()
     return "ltr"
 end
 
+local function saveSetting(settings, key, value)
+    if settings and settings.saveSetting then
+        settings:saveSetting(key, value)
+    end
+end
+
+local function saveGlobalSetting(key, value)
+    if G_reader_settings and G_reader_settings.saveSetting then
+        G_reader_settings:saveSetting(key, value)
+    end
+end
+
+local function setGlobalBoolean(key, value)
+    if not G_reader_settings then return end
+    if value and G_reader_settings.makeTrue then
+        G_reader_settings:makeTrue(key)
+    elseif not value and G_reader_settings.makeFalse then
+        G_reader_settings:makeFalse(key)
+    else
+        saveGlobalSetting(key, value)
+    end
+end
+
+-- Apply the reader defaults this plugin is tuned for. These are KOReader's own
+-- settings/events, not detector thresholds.
+function PanelZoomIntegration:applyPreferredReaderDefaults()
+    if not self.plugin_enabled then return end
+    if not self.apply_koreader_defaults then return end
+    if not self.ui or not self.ui.document or not self.ui.paging then return end
+
+    local document = self.ui.document
+    local doc_path = document.file or tostring(document)
+    if self._reader_defaults_doc_path == doc_path then return end
+    self._reader_defaults_doc_path = doc_path
+
+    local cfg = document.configurable
+    if not cfg then return end
+
+    local d = READER_DEFAULTS
+    local doc_settings = self.ui.doc_settings
+
+    saveGlobalSetting("kopt_rotation_mode", d.rotation_mode)
+    saveGlobalSetting("kopt_trim_page", d.trim_page)
+    saveGlobalSetting("kopt_zoom_mode_genus", d.zoom_mode_genus)
+    saveGlobalSetting("kopt_zoom_mode_type", d.zoom_mode_type)
+    saveGlobalSetting("kopt_page_scroll", d.page_scroll)
+    saveGlobalSetting("kopt_contrast", d.contrast)
+
+    saveSetting(doc_settings, "kopt_rotation_mode", d.rotation_mode)
+    saveSetting(doc_settings, "kopt_trim_page", d.trim_page)
+    saveSetting(doc_settings, "zoom_mode", d.zoom_mode)
+    saveSetting(doc_settings, "normal_zoom_mode", d.zoom_mode)
+    saveSetting(doc_settings, "kopt_zoom_mode_genus", d.zoom_mode_genus)
+    saveSetting(doc_settings, "kopt_zoom_mode_type", d.zoom_mode_type)
+    saveSetting(doc_settings, "kopt_page_scroll", d.page_scroll)
+    saveSetting(doc_settings, "kopt_contrast", d.contrast)
+
+    cfg.trim_page = d.trim_page
+    cfg.zoom_mode_genus = d.zoom_mode_genus
+    cfg.zoom_mode_type = d.zoom_mode_type
+    cfg.page_scroll = d.page_scroll
+    cfg.contrast = d.contrast
+
+    if Device:hasEinkScreen() then
+        if Device:canHWDither() then
+            setGlobalBoolean("dev_no_hw_dither", false)
+            setGlobalBoolean("dev_no_sw_dither", true)
+            if not Screen.hw_dithering and Screen.toggleHWDithering then
+                Screen:toggleHWDithering(true)
+            end
+            if Screen.sw_dithering and Screen.toggleSWDithering then
+                Screen:toggleSWDithering(false)
+            end
+            saveGlobalSetting("kopt_hw_dithering", d.dithering)
+            saveSetting(doc_settings, "kopt_hw_dithering", d.dithering)
+            cfg.hw_dithering = d.dithering
+            document.hw_dithering = true
+            document.sw_dithering = false
+        elseif Screen.fb_bpp == 8 then
+            setGlobalBoolean("dev_no_sw_dither", false)
+            if not Screen.sw_dithering and Screen.toggleSWDithering then
+                Screen:toggleSWDithering(true)
+            end
+            saveGlobalSetting("kopt_sw_dithering", d.dithering)
+            saveSetting(doc_settings, "kopt_sw_dithering", d.dithering)
+            cfg.sw_dithering = d.dithering
+            document.sw_dithering = true
+        end
+    end
+
+    self.ui:handleEvent(Event:new("SetRotationMode", d.rotation_mode))
+    self.ui:handleEvent(Event:new("SetScrollMode", false))
+    self.ui:handleEvent(Event:new("SetZoomMode", d.zoom_mode))
+    self.ui:handleEvent(Event:new("GammaUpdate", d.contrast, true))
+    self.ui:handleEvent(Event:new("PageCrop", "none"))
+    self.ui:handleEvent(Event:new("DitheringUpdate"))
+
+    logger.info(string.format(
+        "DynamicPanelZoom: Applied KOReader defaults rotation=%s crop=none fit=full view=page contrast=%.1f dithering=on",
+        tostring(d.rotation_mode), d.contrast))
+end
+
 -- Check if document is compatible and integrate with Panel Zoom automatically
 function PanelZoomIntegration:checkAndIntegratePanelZoom()
     if not self.ui.document then return end
-    
+    -- Page-based documents only (PDF/DjVu/CBZ...). Rolling documents (EPUB)
+    -- have no panel geometry and must keep their normal hold behavior.
+    if not self.ui.paging then return end
+
     local doc_path = self.ui.document.file
     if not doc_path then return end
+
+    if not self.plugin_enabled then
+        self._json_available = false
+        logger.info("DynamicPanelZoom: Plugin disabled; keeping original panel zoom behavior")
+        return
+    end
     
     -- Dynamic Panel Zoom is always available, we just integrate it
     self._json_available = true -- we fake it to keep the integration flag happy
@@ -188,6 +339,55 @@ function PanelZoomIntegration:restoreOCR()
         self.ui.menu.ocr_menu.enabled = self._original_ocr_menu_enabled
         self._original_ocr_menu_enabled = nil
         logger.info("DynamicPanelZoom: OCR menu items restored")
+    end
+end
+
+function PanelZoomIntegration:setDebugLogsEnabled(enabled)
+    self.debug_log_panels = enabled
+    self.dump_analysis_pgm = enabled
+    logger.info("DynamicPanelZoom: Debug logs set to " .. tostring(enabled))
+    self._panel_cache = {}
+    self.current_panels = {}
+end
+
+function PanelZoomIntegration:setPluginEnabled(enabled)
+    self.plugin_enabled = enabled
+    self._panel_cache = {}
+    self.current_panels = {}
+
+    if enabled then
+        logger.info("DynamicPanelZoom: Plugin activated")
+        self:checkAndIntegratePanelZoom()
+        return
+    end
+
+    logger.info("DynamicPanelZoom: Plugin deactivated")
+    self._json_available = false
+    self.integration_mode = false
+    if self._current_imgviewer then
+        self:closeViewer()
+    end
+    if self.ui and self.ui.highlight then
+        if self._original_panel_zoom_handler then
+            self.ui.highlight.onPanelZoom = self._original_panel_zoom_handler
+        end
+        if self._original_panel_zoom_enabled ~= nil then
+            self.ui.highlight.panel_zoom_enabled = self._original_panel_zoom_enabled
+        end
+    end
+    self:restoreOCR()
+end
+
+function PanelZoomIntegration:getFallbackToTextSelection()
+    return self.ui and self.ui.highlight and self.ui.highlight.panel_zoom_fallback_to_text_selection
+end
+
+function PanelZoomIntegration:toggleFallbackToTextSelection()
+    if not (self.ui and self.ui.highlight) then return end
+    if self.ui.highlight.onToggleFallbackTextSelection then
+        self.ui.highlight:onToggleFallbackTextSelection()
+    else
+        self.ui.highlight.panel_zoom_fallback_to_text_selection = not self.ui.highlight.panel_zoom_fallback_to_text_selection
     end
 end
 
@@ -349,7 +549,7 @@ function PanelZoomIntegration:preloadNextPanel()
                 local rect = self:panelToRect(next_panel, dim, margin)
                 
                 -- Render the next panel with document settings (standard margins for preloading)
-                local image, rotate, custom_position = self:drawPagePartWithSettings(page, rect, center, next_panel, dim)
+                local image, rotate, custom_position, panel_screen_rect = self:drawPagePartWithSettings(page, rect, center, next_panel, dim)
                 -- Store preloaded image with panel data for proper centering
                 if image then
                     self._preloaded_image = image
@@ -357,6 +557,7 @@ function PanelZoomIntegration:preloadNextPanel()
                     self._preloaded_panel = next_panel  -- Store panel data
                     self._preloaded_dim = dim          -- Store dimensions
                     self._preloaded_custom_position = custom_position  -- Store calculated position
+                    self._preloaded_panel_screen_rect = panel_screen_rect
                     logger.info("DynamicPanelZoom: Successfully preloaded next panel with document settings")
                 else
                     logger.warn("DynamicPanelZoom: Failed to preload next panel")
@@ -364,6 +565,90 @@ function PanelZoomIntegration:preloadNextPanel()
             end
         end
     end
+end
+
+function PanelZoomIntegration:refreshPanelViewer(panel_viewer)
+    if not panel_viewer then return end
+
+    local clear_region, had_previous_region, draw_region
+    if panel_viewer.consumeTransitionClearRegion then
+        clear_region, had_previous_region, draw_region = panel_viewer:consumeTransitionClearRegion()
+    else
+        clear_region = panel_viewer.dimen
+        had_previous_region = false
+    end
+    draw_region = draw_region or (had_previous_region and clear_region) or panel_viewer.dimen
+
+    if PANEL_FULL_SCREEN_TRANSITION then
+        local full_region = Geom:new{
+            x = 0,
+            y = 0,
+            w = Screen:getWidth(),
+            h = Screen:getHeight(),
+        }
+        clear_region = full_region
+        draw_region = full_region
+    end
+
+    local screen_area = math.max(1, Screen:getWidth() * Screen:getHeight())
+    local clear_pct = (clear_region.w * clear_region.h * 100) / screen_area
+    local draw_pct = (draw_region.w * draw_region.h * 100) / screen_area
+
+    logger.info(string.format(
+        "DynamicPanelZoom: Performing transition refresh clear_mode=%s draw_mode=%s luma=%d direct=%s force_draw=%s full_screen=%s single_full_draw=%s clear=%d,%d %dx%d area=%.1f%% draw=%d,%d %dx%d area=%.1f%%",
+        PANEL_CLEAR_REFRESH_MODE,
+        PANEL_DRAW_REFRESH_MODE,
+        PANEL_CLEAR_LUMA,
+        tostring(PANEL_DIRECT_CLEAR),
+        tostring(PANEL_FORCE_DRAW_REPAINT),
+        tostring(PANEL_FULL_SCREEN_TRANSITION),
+        tostring(PANEL_SINGLE_FULL_DRAW),
+        clear_region.x, clear_region.y, clear_region.w, clear_region.h,
+        clear_pct,
+        draw_region.x, draw_region.y, draw_region.w, draw_region.h,
+        draw_pct))
+
+    if PANEL_SINGLE_FULL_DRAW
+        and PANEL_FULL_SCREEN_TRANSITION then
+        panel_viewer:setClearOnly(false)
+        panel_viewer:update(PANEL_CLEAR_REFRESH_MODE, draw_region, Screen.sw_dithering)
+        logger.info("DynamicPanelZoom: Queued final panel with single full refresh")
+        return
+    end
+
+    if PANEL_DIRECT_CLEAR and Screen.bb then
+        Screen.bb:paintRect(clear_region.x, clear_region.y, clear_region.w, clear_region.h,
+            Blitbuffer.Color8(PANEL_CLEAR_LUMA))
+        if PANEL_CLEAR_REFRESH_MODE == "full" and Screen.refreshFull then
+            Screen:refreshFull(clear_region.x, clear_region.y, clear_region.w, clear_region.h)
+        elseif PANEL_CLEAR_REFRESH_MODE == "flashui" and Screen.refreshFlashUI then
+            Screen:refreshFlashUI(clear_region.x, clear_region.y, clear_region.w, clear_region.h)
+        elseif PANEL_CLEAR_REFRESH_MODE == "ui" and Screen.refreshUI then
+            Screen:refreshUI(clear_region.x, clear_region.y, clear_region.w, clear_region.h)
+        elseif PANEL_CLEAR_REFRESH_MODE == "fast" and Screen.refreshFast then
+            Screen:refreshFast(clear_region.x, clear_region.y, clear_region.w, clear_region.h)
+        else
+            panel_viewer:update(PANEL_CLEAR_REFRESH_MODE, clear_region, Screen.sw_dithering)
+            if UIManager.forceRePaint then UIManager:forceRePaint() end
+        end
+    else
+        panel_viewer:setClearOnly(true, PANEL_CLEAR_LUMA)
+        panel_viewer:update(PANEL_CLEAR_REFRESH_MODE, clear_region, Screen.sw_dithering)
+        if UIManager.forceRePaint then UIManager:forceRePaint() end
+    end
+
+    if PANEL_CLEAR_EPDC_SLEEP_US > 0 and UIManager.yieldToEPDC then
+        UIManager:yieldToEPDC(PANEL_CLEAR_EPDC_SLEEP_US)
+    end
+
+    if self._current_imgviewer ~= panel_viewer then
+        panel_viewer:setClearOnly(false)
+        return
+    end
+
+    panel_viewer:setClearOnly(false)
+    panel_viewer:update(PANEL_DRAW_REFRESH_MODE, draw_region, Screen.sw_dithering)
+    if PANEL_FORCE_DRAW_REPAINT and UIManager.forceRePaint then UIManager:forceRePaint() end
 end
 
 -- Display preloaded panel instantly
@@ -395,10 +680,13 @@ function PanelZoomIntegration:displayPreloadedPanel()
         custom_position.x, custom_position.y, image_w, image_h, screen_w, screen_h))
     
     self._current_imgviewer:updateCustomPosition(custom_position)
+    if self._current_imgviewer.updatePanelScreenRect then
+        self._current_imgviewer:updatePanelScreenRect(self._preloaded_panel_screen_rect)
+    end
     logger.info(string.format("PanelZoom: Updated custom position for preloaded panel - x:%d, y:%d (image:%dx%d, screen:%dx%d)", 
         custom_position.x, custom_position.y, image_w, image_h, screen_w, screen_h))
     
-    self._current_imgviewer:update()
+    self:refreshPanelViewer(self._current_imgviewer)
     
     -- Clear preloaded data after use
     self._preloaded_image = nil
@@ -406,6 +694,7 @@ function PanelZoomIntegration:displayPreloadedPanel()
     self._preloaded_panel = nil
     self._preloaded_dim = nil
     self._preloaded_custom_position = nil
+    self._preloaded_panel_screen_rect = nil
     
     -- Start preloading the next panel
     UIManager:scheduleIn(0.1, function()
@@ -458,27 +747,51 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_cente
         y = math.floor(math.max(padding, math.min(pos_y, screen_h - display_h - padding)) + 0.5)
     }
 
-    -- 6. ASPECT RATIO NUDGES (Original offsets)
-    if panel and dim then
-        local panel_aspect_ratio = (panel.w * dim.w) / (panel.h * dim.h)
-        if panel_aspect_ratio >= 0.67 then
-            custom_position.x = custom_position.x - 1
-        else
-            custom_position.y = custom_position.y - 0
-        end
+    local panel_screen_rect
+    if panel and dim and panel.x and panel.y and panel.w and panel.h then
+        local panel_x0 = custom_position.x + ((panel.x * dim.w) - rect.x) * final_scale
+        local panel_y0 = custom_position.y + ((panel.y * dim.h) - rect.y) * final_scale
+        local panel_x1 = custom_position.x + (((panel.x + panel.w) * dim.w) - rect.x) * final_scale
+        local panel_y1 = custom_position.y + (((panel.y + panel.h) * dim.h) - rect.y) * final_scale
+
+        panel_screen_rect = {
+            x = math.floor(panel_x0),
+            y = math.floor(panel_y0),
+            w = math.max(1, math.ceil(panel_x1) - math.floor(panel_x0)),
+            h = math.max(1, math.ceil(panel_y1) - math.floor(panel_y0)),
+        }
+
+        logger.info(string.format(
+            "DynamicPanelZoom: Semantic panel screen rect %d,%d %dx%d",
+            panel_screen_rect.x,
+            panel_screen_rect.y,
+            panel_screen_rect.w,
+            panel_screen_rect.h
+        ))
     end
 
-    -- 7. RENDER
-    -- Create the geometry for MuPDF
+    -- 6. RENDER
+    -- Attach the prescaled rect so Document:renderPage knows we handled the
+    -- scaling ourselves (same contract as Document:drawPagePart).
     local geom_rect = Geom:new(rect)
     local scaled_rect = geom_rect:copy()
     scaled_rect:transformByScale(final_scale, final_scale)
     rect.scaled_rect = scaled_rect
 
-    local tile = self.ui.document:renderPage(pageno, rect, final_scale, 0, gamma, true)
-    local image = tile.bb
+    -- Current KOReader signature: renderPage(pageno, rect, zoom, rotation, gamma, saturation, hinting).
+    local ok, tile = pcall(self.ui.document.renderPage, self.ui.document,
+        pageno, rect, final_scale, 0, gamma, 1.0, true)
+    if not ok or not tile or not tile.bb then
+        logger.err("DynamicPanelZoom: renderPage failed: " .. tostring(tile))
+        return nil
+    end
 
-    -- 8. POST-PROCESSING
+    -- tile.bb belongs to KOReader's DocCache: it can be evicted and freed at
+    -- any time, and mutating it would corrupt the shared cache. Hand out a
+    -- private copy instead; the viewer owns and frees it.
+    local image = tile.bb:copy()
+
+    -- 7. POST-PROCESSING
     if image then
         if contrast ~= 1.0 and image.contrast then
             image:contrast(contrast)
@@ -491,7 +804,7 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_cente
             padding, display_w, display_h, custom_position.x, custom_position.y))
     end
 
-    return image, false, custom_position
+    return image, false, custom_position, panel_screen_rect
 end
 
 -- Apply KOReader's contrast and gamma settings to image buffer
@@ -528,10 +841,18 @@ end
 function PanelZoomIntegration:cleanupPreloadedImage()
     if self._preloaded_image then
         logger.info("DynamicPanelZoom: Cleaning up preloaded image")
-        self._preloaded_image = nil
-        self._preloaded_panel_index = nil
-        self._preloaded_custom_position = nil
+        -- The preloaded image is our own copy (drawPagePartWithSettings), so
+        -- it must be freed when discarded without being displayed.
+        if self._preloaded_image.free then
+            self._preloaded_image:free()
+        end
     end
+    self._preloaded_image = nil
+    self._preloaded_panel_index = nil
+    self._preloaded_panel = nil
+    self._preloaded_dim = nil
+    self._preloaded_custom_position = nil
+    self._preloaded_panel_screen_rect = nil
 end
 
 function PanelZoomIntegration:changePage(diff)
@@ -623,51 +944,26 @@ function PanelZoomIntegration:_onPageChangeComplete(new_page_no)
 end
 
 function PanelZoomIntegration:getSafePageNumber()
-    -- Try multiple methods to get the current page number
-    local page = nil
-    
-    -- Method 1: Try ui.paging.getPage()
-    if self.ui.paging and self.ui.paging.getPage then 
-        page = self.ui.paging:getPage()
-        logger.info(string.format("PanelZoom: Method 1 - ui.paging.getPage() -> %d", page))
+    if self.ui.paging and self.ui.paging.current_page and self.ui.paging.current_page > 0 then
+        return self.ui.paging.current_page
     end
-    
-    -- Method 2: Try ui.paging.cur_page
-    if not page and self.ui.paging and self.ui.paging.cur_page then 
-        page = self.ui.paging.cur_page
-        logger.info(string.format("PanelZoom: Method 2 - ui.paging.cur_page -> %d", page))
+    if self.ui.view and self.ui.view.state and self.ui.view.state.page then
+        return self.ui.view.state.page
     end
-    
-    -- Method 3: Try ui.document.current_page
-    if not page and self.ui.document and self.ui.document.current_page then 
-        page = self.ui.document.current_page
-        logger.info(string.format("PanelZoom: Method 3 - ui.document.current_page -> %d", page))
-    end
-    
-    -- Method 4: Try ui.view.state.page
-    if not page and self.ui.view and self.ui.view.state and self.ui.view.state.page then 
-        page = self.ui.view.state.page
-        logger.info(string.format("PanelZoom: Method 4 - ui.view.state.page -> %d", page))
-    end
-    
-    -- Method 5: Try getting from the highlighting system
-    if not page and self.ui.highlight and self.ui.highlight.page then 
-        page = self.ui.highlight.page
-        logger.info(string.format("PanelZoom: Method 5 - ui.highlight.page -> %d", page))
-    end
-    
-    -- Fallback
-    if not page then 
-        page = 1
-        logger.info("PanelZoom: Using fallback page number 1")
-    end
-    
-    return page
+    return 1
 end
 
 function PanelZoomIntegration:onIntegratedPanelZoom(arg, ges)
     -- Ensure we have the gesture object
     local actual_ges = (type(arg) == "table" and arg.pos) and arg or ges
+
+    if not self.plugin_enabled then
+        logger.info("DynamicPanelZoom: Plugin disabled, using original Panel Zoom")
+        if self._original_panel_zoom_handler then
+            return self._original_panel_zoom_handler(self.ui.highlight, arg, ges)
+        end
+        return false
+    end
     
     -- If JSON is not available, fall back to built-in Panel Zoom
     if not self._json_available then
@@ -721,15 +1017,21 @@ function PanelZoomIntegration:importToggleZoomPanels()
         return
     end
     
-    logger.info(string.format("DynamicPanelZoom: Analyzing page %d for %s panels dynamically", page_idx, reading_dir))
-    if self.experimental_panel_sorting_enabled then
-        self.current_panels = self:analyzePageForPanelsExperimental(page_idx)
-    else
-        self.current_panels = self:analyzePageForPanels(page_idx)
+    self:debugLog(string.format("DynamicPanelZoom: Analyzing page %d for %s panels dynamically", page_idx, reading_dir))
+    -- Detection is synchronous and can take up to ~1s on device: give the
+    -- user immediate feedback instead of a frozen screen.
+    local analyzing_msg = InfoMessage:new{ text = _("Analyzing page…") }
+    UIManager:show(analyzing_msg)
+    UIManager:forceRePaint()
+    local panels, analysis_error = self:analyzePageForPanels(page_idx)
+    self.current_panels = panels
+    UIManager:close(analyzing_msg)
+
+    -- Cache the layout — but never cache an error fallback, so a transient
+    -- failure doesn't poison the page until KOReader restarts.
+    if not analysis_error then
+        self._panel_cache[doc_path][reading_dir][page_idx] = self.current_panels
     end
-    
-    -- Cache it for this document and page and direction
-    self._panel_cache[doc_path][reading_dir][page_idx] = self.current_panels
     
     if #self.current_panels > 0 then
         logger.info(string.format("DynamicPanelZoom: SUCCESS! Detected %d panels for page %d (%s)", #self.current_panels, page_idx, reading_dir))
@@ -738,359 +1040,221 @@ function PanelZoomIntegration:importToggleZoomPanels()
     end
 end
 
-function PanelZoomIntegration:analyzePageForPanels(pageno)
+function PanelZoomIntegration:_extractRawBoxes(pageno)
     local ffi = require("ffi")
-    local leptonica = ffi.loadlib("leptonica", "6")
-    
-    if not self.ui.document or not self.ui.document._document then return {} end
-    
-    -- Re-use or instantiate KOPTContext
-    local KOPTContext = require("ffi/koptcontext")
-    local page_size = self.ui.document:getNativePageDimensions(pageno)
-    
+    local time_start = os.clock()
+
+    local doc = self.ui.document
+    if not doc or not doc._document then return {} end
+
+    local page_size = doc:getNativePageDimensions(pageno)
     if not page_size then return {} end
-    
-    -- Limit the dimensions to avoid OOM or slow processing
-    local target_w = page_size.w
-    local target_h = page_size.h
-    
+
     local bbox = {
         x0 = 0, y0 = 0,
-        x1 = target_w,
-        y1 = target_h,
+        x1 = page_size.w,
+        y1 = page_size.h,
     }
-    
-    -- We can get the koptinterface from pdfdocument/cbzdocument if needed,
-    -- or manually via KoptInterface:createContext
-    local Document = require("document/document")
-    local koptinterface
-    if self.ui.document.koptinterface then
-        koptinterface = self.ui.document.koptinterface
-    end
-    
+
+    -- Create the render context the same way KOReader's own panel detector
+    -- does (koptinterface:getPanelFromPage), then downscale: ~1000px long
+    -- side is enough for gutter geometry, suppresses halftone/texture noise,
+    -- and keeps the per-pixel loops cheap on device.
     local kc
-    if koptinterface and koptinterface.createContext then
-        kc = koptinterface:createContext(self.ui.document, pageno, bbox)
+    if doc.koptinterface and doc.koptinterface.createContext then
+        kc = doc.koptinterface:createContext(doc, pageno, bbox)
     else
-        -- Fallback: manual creation
+        local KOPTContext = require("ffi/koptcontext")
         kc = KOPTContext.new()
-        kc:setZoom(1.0)
         kc:setBBox(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
     end
-    
-    local page = self.ui.document._document:openPage(pageno)
-    if not page then 
+    -- getNativePageDimensions returns POINTS for image-based documents (a
+    -- 1920px CBZ page reports ~461), so the zoom may legitimately exceed 1.0:
+    -- MuPDF then samples the full-resolution source down to our target size.
+    local scale = ANALYSIS_TARGET_PX / math.max(page_size.w, page_size.h)
+    scale = math.min(scale, 4.0)
+    kc:setZoom(scale)
+
+    local page = doc._document:openPage(pageno)
+    if not page then
         if kc.free then kc:free() end
-        return {} 
+        return {}
     end
-    
-    page:getPagePix(kc, self.ui.document.render_mode)
-    
-    local panels = {}
-    
-    if kc.src.data then
-        local KOPTContextClass = require("ffi/koptcontext")
-        local k2pdfopt = KOPTContextClass.k2pdfopt
-        
-        -- Helper destructors for FFI to avoid memory leaks
-        local function _gc_ptr(p, destructor)
-            return p and ffi.gc(p, destructor)
-        end
-        local function pixDestroy(pix)
-            leptonica.pixDestroy(ffi.new('PIX *[1]', pix))
-            ffi.gc(pix, nil)
-        end
-        local function boxDestroy(box)
-            leptonica.boxDestroy(ffi.new('BOX *[1]', box))
-            ffi.gc(box, nil)
-        end
-        local function boxaDestroy(boxa)
-            leptonica.boxaDestroy(ffi.new('BOXA *[1]', boxa))
-            ffi.gc(boxa, nil)
+
+    local ok, panels, info = pcall(function()
+        page:getPagePix(kc, doc.render_mode,
+            doc.configurable and doc.configurable.background_cleanup)
+
+        local src = kc.src
+        local w, h, bpp = src.width, src.height, src.bpp
+        if src.data == nil or w <= 0 or h <= 0 then
+            error("empty render bitmap")
         end
 
-        local pixs = _gc_ptr(k2pdfopt.bitmap2pix(kc.src, 0, 0, kc.src.width, kc.src.height), pixDestroy)
-        
-        local pixg
-        if leptonica.pixGetDepth(pixs) == 32 then
-            pixg = leptonica.pixConvertRGBToGrayFast(pixs)
+        local bytes_px = math.floor(bpp / 8)
+        if bytes_px < 1 then
+            error("unsupported bitmap depth: " .. tostring(bpp))
+        end
+        local data = ffi.cast("uint8_t*", src.data)
+
+        -- The analysis bitmap data is tightly packed. src.size_allocated is
+        -- allocation capacity, not row pitch; treating it as padded stride
+        -- shears odd-width 24bpp renders before the detector sees them.
+        local tight = w * bytes_px
+        local padded = math.ceil(tight / 4) * 4
+        local stride = tight
+        local alloc = tonumber(src.size_allocated) or 0
+        self:debugLog(string.format(
+            "DynamicPanelZoom: analysis render %dx%d bpp=%d stride=%d tight=%d padded=%d alloc=%d scale=%.3f",
+            w, h, bpp, stride, tight, padded, alloc, scale))
+
+        local pix
+        if bytes_px == 1 then
+            pix = function(x, y) return data[y * stride + x] end
         else
-            pixg = leptonica.pixClone(pixs)
-        end
-        pixg = _gc_ptr(pixg, pixDestroy)
-        
-        local pix_inverted = _gc_ptr(leptonica.pixInvert(nil, pixg), pixDestroy)
-        local pix_thresholded = _gc_ptr(leptonica.pixThresholdToBinary(pix_inverted, 50), pixDestroy)
-        leptonica.pixInvert(pix_thresholded, pix_thresholded)
-        
-        local bb = _gc_ptr(leptonica.pixConnCompBB(pix_thresholded, 8), boxaDestroy)
-        
-        local img_w = leptonica.pixGetWidth(pixs)
-        local img_h = leptonica.pixGetHeight(pixs)
-        
-        local function boxGetGeometry(box)
-            local geo = ffi.new('l_int32[4]')
-            leptonica.boxGetGeometry(box, geo, geo + 1, geo + 2, geo + 3)
-            return tonumber(geo[0]), tonumber(geo[1]), tonumber(geo[2]), tonumber(geo[3])
+            -- Must return an INTEGER 0..255 (PanelDetect histograms by value).
+            local rshift = require("bit").rshift
+            pix = function(x, y)
+                local off = y * stride + x * bytes_px
+                return rshift(data[off] * 77 + data[off + 1] * 150 + data[off + 2] * 29, 8)
+            end
         end
 
-        local count = leptonica.boxaGetCount(bb)
-        for index = 0, count - 1 do
-            local box = _gc_ptr(leptonica.boxaGetBox(bb, index, leptonica.L_CLONE), boxDestroy)
-            
-            local pix_tmp = _gc_ptr(leptonica.pixClipRectangle(pixs, box, nil), pixDestroy)
-            local w = leptonica.pixGetWidth(pix_tmp)
-            local h = leptonica.pixGetHeight(pix_tmp)
-            
-            if w >= img_w / 8 and h >= img_h / 8 then
-                local box_x, box_y, box_w, box_h = boxGetGeometry(box)
-                
-                table.insert(panels, {
-                    x = box_x / target_w,
-                    y = box_y / target_h,
-                    w = box_w / target_w,
-                    h = box_h / target_h,
-                })
-            end
-            -- Note: Memory is handled automatically by _gc_ptr!
+        -- Verbose diagnostics to crash.log: a luma histogram every analysis
+        -- (cheap, always on with debug logging) and, when the dump is enabled,
+        -- the EXACT grayscale buffer as base64 -- so a device render can be
+        -- reproduced pixel-for-pixel in the desktop harness (which resamples
+        -- the source JPG itself and cannot otherwise see MuPDF/eink dither or
+        -- background_cleanup speckle).
+        if self.debug_log_panels then
+            self:logLumaHistogram(pix, w, h)
         end
-    end
-    
+        if self.dump_analysis_pgm then
+            self:dumpAnalysisPGM(pageno, pix, w, h)
+        end
+
+        return PanelDetect.detect(pix, w, h)
+    end)
+
     page:close()
     if kc.free then kc:free() end
-    
-    -- Sort panels based on reading direction (Manga TR->BL)
-    local effective_dir = self:getEffectiveReadingDirection()
-    table.sort(panels, function(a, b)
-        -- We want to sort primarily top-to-bottom, and secondarily according to direction
-        -- If their y ranges overlap significantly, they are on the same "row"
-        local a_center_y = a.y + (a.h / 2)
-        local b_center_y = b.y + (b.h / 2)
-        
-        -- Rough same-row threshold ~10% of page height
-        if math.abs(a_center_y - b_center_y) < 0.1 then
-            if effective_dir == "rtl" then
-                return a.x > b.x -- Right to Left
-            else
-                return a.x < b.x -- Left to Right
-            end
-        end
-        
-        return a_center_y < b_center_y -- Top to bottom
-    end)
-    
+
+    if not ok then
+        logger.err("DynamicPanelZoom: panel detection failed: " .. tostring(panels))
+        return { { x = 0, y = 0, w = 1, h = 1 } }, true
+    end
+
+    logger.info(string.format(
+        "DynamicPanelZoom: detected %d panels in %.0f ms (bg=%d tol=%.3f raw=%d coverage=%.2f fallback=%s)",
+        #panels, (os.clock() - time_start) * 1000,
+        info.background or -1, info.tolerance_used or -1, info.raw_count or -1,
+        info.coverage or 0, tostring(info.fallback)))
+
     return panels
 end
 
-function PanelZoomIntegration:analyzePageForPanelsExperimental(pageno)
-    local ffi = require("ffi")
-    local leptonica = ffi.loadlib("leptonica", "6")
-    
-    if not self.ui.document or not self.ui.document._document then return {} end
-    
-    local KOPTContext = require("ffi/koptcontext")
-    local page_size = self.ui.document:getNativePageDimensions(pageno)
-    
-    if not page_size then return {} end
-    
-    local target_w = page_size.w
-    local target_h = page_size.h
-    
-    local bbox = {
-        x0 = 0, y0 = 0,
-        x1 = target_w,
-        y1 = target_h,
-    }
-    
-    local Document = require("document/document")
-    local koptinterface
-    if self.ui.document.koptinterface then
-        koptinterface = self.ui.document.koptinterface
-    end
-    
-    local kc
-    if koptinterface and koptinterface.createContext then
-        kc = koptinterface:createContext(self.ui.document, pageno, bbox)
-    else
-        kc = KOPTContext.new()
-        kc:setZoom(1.0)
-        kc:setBBox(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
-    end
-    
-    local page = self.ui.document._document:openPage(pageno)
-    if not page then 
-        if kc.free then kc:free() end
-        return {} 
-    end
-    
-    page:getPagePix(kc, self.ui.document.render_mode)
-    
-    local initial_boxes = {}
-    
-    if kc.src.data then
-        local KOPTContextClass = require("ffi/koptcontext")
-        local k2pdfopt = KOPTContextClass.k2pdfopt
-        
-        local function _gc_ptr(p, destructor)
-            return p and ffi.gc(p, destructor)
-        end
-        local function pixDestroy(pix)
-            leptonica.pixDestroy(ffi.new('PIX *[1]', pix))
-            ffi.gc(pix, nil)
-        end
-        local function boxDestroy(box)
-            leptonica.boxDestroy(ffi.new('BOX *[1]', box))
-            ffi.gc(box, nil)
-        end
-        local function boxaDestroy(boxa)
-            leptonica.boxaDestroy(ffi.new('BOXA *[1]', boxa))
-            ffi.gc(boxa, nil)
-        end
+function PanelZoomIntegration:analyzePageForPanels(pageno)
+    local panels, analysis_error = self:_extractRawBoxes(pageno)
+    panels = PanelDetect.sort(panels, self:getEffectiveReadingDirection())
 
-        local pixs = _gc_ptr(k2pdfopt.bitmap2pix(kc.src, 0, 0, kc.src.width, kc.src.height), pixDestroy)
-        
-        local pixg
-        if leptonica.pixGetDepth(pixs) == 32 then
-            pixg = leptonica.pixConvertRGBToGrayFast(pixs)
-        else
-            pixg = leptonica.pixClone(pixs)
-        end
-        pixg = _gc_ptr(pixg, pixDestroy)
-        
-        local pix_inverted = _gc_ptr(leptonica.pixInvert(nil, pixg), pixDestroy)
-        local pix_thresholded = _gc_ptr(leptonica.pixThresholdToBinary(pix_inverted, 50), pixDestroy)
-        leptonica.pixInvert(pix_thresholded, pix_thresholded)
-        
-        local bb = _gc_ptr(leptonica.pixConnCompBB(pix_thresholded, 8), boxaDestroy)
-        
-        local img_w = leptonica.pixGetWidth(pixs)
-        local img_h = leptonica.pixGetHeight(pixs)
-        
-        local function boxGetGeometry(box)
-            local geo = ffi.new('l_int32[4]')
-            leptonica.boxGetGeometry(box, geo, geo + 1, geo + 2, geo + 3)
-            return tonumber(geo[0]), tonumber(geo[1]), tonumber(geo[2]), tonumber(geo[3])
-        end
-
-        local count = leptonica.boxaGetCount(bb)
-        for index = 0, count - 1 do
-            local box = _gc_ptr(leptonica.boxaGetBox(bb, index, leptonica.L_CLONE), boxDestroy)
-            
-            -- We don't filter during extraction, we just get all boxes
-            local box_x, box_y, box_w, box_h = boxGetGeometry(box)
-            table.insert(initial_boxes, {
-                x = box_x / target_w,
-                y = box_y / target_h,
-                w = box_w / target_w,
-                h = box_h / target_h,
-            })
-        end
-    end
-    
-    page:close()
-    if kc.free then kc:free() end
-
-    logger.info(string.format("DynamicPanelZoom (Experimental): Extracted %d raw components from Leptonica", #initial_boxes))
-
-    -- 3.1 Minimum area filter
-    local filtered_boxes = {}
-    local min_area_threshold = 0.02 -- 2% of page area
-    for _, box in ipairs(initial_boxes) do
-        local area = box.w * box.h
-        -- Also check minimum w/h proportions to avoid extremely thin lines being accepted
-        if area >= min_area_threshold and box.w > 0.05 and box.h > 0.05 then
-            table.insert(filtered_boxes, box)
+    if self.debug_log_panels then
+        for i, p in ipairs(panels) do
+            logger.info(string.format("  Panel %d: x=%.3f, y=%.3f, w=%.3f, h=%.3f", i, p.x, p.y, p.w, p.h))
         end
     end
 
-    -- 3.2 Nesting check (discard boxes completely contained in others)
-    local final_boxes = {}
-    for i, box1 in ipairs(filtered_boxes) do
-        local is_nested = false
-        for j, box2 in ipairs(filtered_boxes) do
-            if i ~= j then
-                -- Add a small margin of error (0.01) for the nesting check
-                if box1.x >= box2.x - 0.01 and box1.y >= box2.y - 0.01 and 
-                   (box1.x + box1.w) <= (box2.x + box2.w) + 0.01 and 
-                   (box1.y + box1.h) <= (box2.y + box2.h) + 0.01 then
-                    is_nested = true
-                    break
-                end
+    return panels, analysis_error
+end
+
+-- Log a diagnostic line to crash.log via KOReader's logger (the only sink;
+-- no separate files). crash.log survives restarts and is the single file the
+-- user hands over.
+function PanelZoomIntegration:debugLog(msg)
+    logger.info(msg)
+end
+
+-- Diagnostic: emit the EXACT analysis grayscale buffer into crash.log as a
+-- base64 PGM, so a device mis-detection can be reproduced pixel-for-pixel in
+-- the desktop harness (dither / background_cleanup speckle the harness cannot
+-- otherwise see). Every line carries the sentinel "PZPGM" AFTER the logger's
+-- timestamp prefix, so the harness parser strips the prefix by splitting on
+-- the sentinel -- no dependence on the exact logger format.
+local B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+function PanelZoomIntegration:dumpAnalysisPGM(pageno, pix, w, h)
+    local ok, err = pcall(function()
+        -- 1. Pack the buffer row-major into a raw byte string, summing the
+        -- pixel values as a cheap integrity checksum (exact: max ~3.3e8 < 2^53).
+        local rows, row = {}, {}
+        local checksum = 0
+        for y = 0, h - 1 do
+            for x = 0, w - 1 do
+                local v = pix(x, y)
+                row[x + 1] = string.char(v)
+                checksum = checksum + v
             end
+            rows[y + 1] = table.concat(row)
         end
-        if not is_nested then
-            table.insert(final_boxes, box1)
+        local raw = table.concat(rows)
+
+        -- 2. Base64-encode (plain arithmetic, no bit-lib dependency).
+        local b = B64_ALPHABET
+        local out, oi, n = {}, 0, #raw
+        for i = 1, n, 3 do
+            local b1, b2, b3 = raw:byte(i, i + 2)
+            local c1 = math.floor(b1 / 4)
+            local c2 = (b1 % 4) * 16 + (b2 and math.floor(b2 / 16) or 0)
+            oi = oi + 1
+            out[oi] = b:sub(c1 + 1, c1 + 1) .. b:sub(c2 + 1, c2 + 1)
+                .. (b2 and b:sub((b2 % 16) * 4 + (b3 and math.floor(b3 / 64) or 0) + 1,
+                              (b2 % 16) * 4 + (b3 and math.floor(b3 / 64) or 0) + 1) or "=")
+                .. (b3 and b:sub(b3 % 64 + 1, b3 % 64 + 1) or "=")
         end
-    end
+        local b64 = table.concat(out)
 
-    logger.info(string.format("DynamicPanelZoom (Experimental): %d components remaining after filtering", #final_boxes))
-
-    -- 4.1 Sort vertically by top `y` coordinate
-    table.sort(final_boxes, function(a, b)
-        return a.y < b.y
+        -- 3. Emit as delimited logger lines (-> crash.log). Each chunk line
+        -- begins with the sentinel so the parser can strip the timestamp
+        -- prefix; BEGIN carries bytes+b64len+checksum so the parser can VERIFY
+        -- the reassembled bitmap is complete before wasting a reproduction.
+        logger.info(string.format("PZPGM_BEGIN page=%d w=%d h=%d bytes=%d b64len=%d checksum=%d",
+            pageno, w, h, n, #b64, checksum))
+        for s = 1, #b64, 4000 do
+            logger.info("PZPGM " .. b64:sub(s, s + 3999))
+        end
+        logger.info(string.format("PZPGM_END page=%d", pageno))
     end)
+    if not ok then
+        logger.warn("DynamicPanelZoom: could not dump analysis PGM: " .. tostring(err))
+    end
+end
 
-    -- 4.2 Group into rows by intersection
-    local rows = {}
-    local current_row = {}
-    local current_row_min_y = nil
-    local current_row_max_y = nil
-
-    for _, box in ipairs(final_boxes) do
-        if #current_row == 0 then
-            table.insert(current_row, box)
-            current_row_min_y = box.y
-            current_row_max_y = box.y + box.h
-        else
-            -- Check intersection with current row bounds
-            local box_max_y = box.y + box.h
-            -- A box intersects the row if its top is before row's bottom, and its bottom is after row's top
-            -- Adding a small margin
-            local margin = 0.05
-            if box.y < current_row_max_y - margin and box_max_y > current_row_min_y + margin then
-                -- Belongs to current row
-                table.insert(current_row, box)
-                -- Update row bounds
-                current_row_min_y = math.min(current_row_min_y, box.y)
-                current_row_max_y = math.max(current_row_max_y, box_max_y)
-            else
-                -- Start a new row
-                table.insert(rows, current_row)
-                current_row = {box}
-                current_row_min_y = box.y
-                current_row_max_y = box.y + box.h
+-- Compact luma histogram (16 buckets) of the analysis buffer, logged to
+-- crash.log. Dithered / speckled device renders show a very different (bimodal,
+-- spiky) distribution than the harness's smooth resample -- visible at a glance
+-- without decoding the full bitmap, and a strong first clue to the culprit.
+function PanelZoomIntegration:logLumaHistogram(pix, w, h)
+    local ok = pcall(function()
+        local h16 = {}
+        for i = 0, 15 do h16[i] = 0 end
+        local step = 2  -- subsample; matches the detector's sampling density
+        local total = 0
+        for y = 0, h - 1, step do
+            for x = 0, w - 1, step do
+                local v = pix(x, y)
+                local bkt = math.floor(v / 16)
+                if bkt > 15 then bkt = 15 end
+                h16[bkt] = h16[bkt] + 1
+                total = total + 1
             end
         end
-    end
-    if #current_row > 0 then
-        table.insert(rows, current_row)
-    end
-
-    -- 4.3 Sort each row horizontally and 4.4 Concatenate
-    local effective_dir = self:getEffectiveReadingDirection()
-    local final_panels = {}
-    
-    for row_idx, row in ipairs(rows) do
-        table.sort(row, function(a, b)
-            if effective_dir == "rtl" then
-                return a.x > b.x
-            else
-                return a.x < b.x
-            end
-        end)
-        
-        for _, box in ipairs(row) do
-            table.insert(final_panels, box)
+        local parts = {}
+        for i = 0, 15 do
+            parts[i + 1] = string.format("%d", h16[i])
         end
-    end
-
-    -- 5.1 Debug log the final ordered panel sequence
-    logger.info(string.format("DynamicPanelZoom (Experimental): Final sequence (%d panels, %d rows) for %s reading direction:", #final_panels, #rows, effective_dir))
-    for i, p in ipairs(final_panels) do
-        logger.info(string.format("  Panel %d: x=%.3f, y=%.3f, w=%.3f, h=%.3f", i, p.x, p.y, p.w, p.h))
-    end
-
-    return final_panels
+        logger.info(string.format(
+            "DynamicPanelZoom: luma histogram (16x16-wide buckets, n=%d): %s",
+            total, table.concat(parts, ",")))
+    end)
+    if not ok then return end
 end
 
 function PanelZoomIntegration:calculatePanelCenter(panel, dim)
@@ -1143,8 +1307,6 @@ function PanelZoomIntegration:panelToRect(panel, dim, apply_margin_percent)
         logger.info(string.format("PanelZoom: Applying constant %.0fpx expanded margins", constant_margin))
     else
         -- Standard Panel Mode: Use default tight constraints
-        local panel_aspect_ratio = pw / ph
-        
         left_extension = 2   -- Less extension on left side
         right_extension = 2 -- 4px + 5px more extension on right
         top_extension = 0.5
@@ -1175,15 +1337,30 @@ function PanelZoomIntegration:panelToRect(panel, dim, apply_margin_percent)
 
         local screen_ratio = screen_width / screen_height
         local rect_ratio = render_rect.w / render_rect.h
+        local smart_fill_strength = tonumber(self.smart_fill_strength) or 1.0
+        smart_fill_strength = math.max(0, math.min(smart_fill_strength, 1))
+
+        -- Some dark/full-bleed pages detect the dominant right-side ink but
+        -- miss sparse left captions or ships in the same bottom panel. If a
+        -- large panel reaches the page bottom and right edge, keep full-width
+        -- context instead of slicing the left side.
+        if panel.x > 0.25
+            and panel.w > 0.55
+            and panel.h > 0.40
+            and panel.x + panel.w > 0.98
+            and panel.y + panel.h > 0.98 then
+            render_rect.x = 0
+            render_rect.w = dim.w
+            logger.info("PanelZoom: Applied full-width edge rescue for large bottom panel")
+            rect_ratio = render_rect.w / render_rect.h
+        end
 
         if rect_ratio > screen_ratio then
             -- Panel is wider than screen: Need to expand vertically (height)
             local target_new_h = render_rect.w / screen_ratio
             local total_expansion_needed = target_new_h - render_rect.h
-            local expansion_per_side = total_expansion_needed / 2
+            local expansion_per_side = (total_expansion_needed * smart_fill_strength) / 2
             
-            -- V4: Apply expansion symmetrically WITHOUT clamping to document bounds
-            -- This allows render_rect.y to be negative and render_rect.h to exceed dim.h
             render_rect.y = render_rect.y - expansion_per_side
             render_rect.h = render_rect.h + (expansion_per_side * 2)
             
@@ -1191,13 +1368,19 @@ function PanelZoomIntegration:panelToRect(panel, dim, apply_margin_percent)
             -- Panel is taller than screen: Need to expand horizontally (width)
             local target_new_w = render_rect.h * screen_ratio
             local total_expansion_needed = target_new_w - render_rect.w
-            local expansion_per_side = total_expansion_needed / 2
+            local expansion_per_side = (total_expansion_needed * smart_fill_strength) / 2
             
-            -- V4: Apply expansion symmetrically WITHOUT clamping to document bounds
-            -- This allows render_rect.x to be negative and render_rect.w to exceed dim.w
             render_rect.x = render_rect.x - expansion_per_side
             render_rect.w = render_rect.w + (expansion_per_side * 2)
         end
+
+        -- KOReader clips source pixels outside the page instead of padding
+        -- them. Clamp the expanded Smart Fill rect back inside the document so
+        -- edge panels do not lose usable screen area to off-page blank space.
+        render_rect.w = math.min(render_rect.w, dim.w)
+        render_rect.h = math.min(render_rect.h, dim.h)
+        render_rect.x = math.max(0, math.min(render_rect.x, dim.w - render_rect.w))
+        render_rect.y = math.max(0, math.min(render_rect.y, dim.h - render_rect.h))
     end
     
     logger.info(string.format("PanelZoom: Panel center:(%.1f,%.1f) render_rect:(%d,%d,%dx%d)", 
@@ -1304,7 +1487,7 @@ function PanelZoomIntegration:switchToZoomMode()
 
     local image_viewer = ImageViewer:new{
         image = expanded_image,
-        image_disposable = false, -- Disabled forced deletion to prevent garbage collection races/color noise
+        image_disposable = true, -- Our private copy: let ImageViewer free it on close
         fullscreen = true,
         with_title_bar = false,
         buttons_visible = true, -- Restored native UI buttons and minimap
@@ -1350,31 +1533,25 @@ function PanelZoomIntegration:displayCurrentPanel()
     logger.info(string.format("DynamicPanelZoom: Panel rect - x:%d, y:%d, w:%d, h:%d", rect.x, rect.y, rect.w, rect.h))
     
     -- Create new image for the panel with document settings
-    local image, rotate, custom_position = self:drawPagePartWithSettings(page, rect, center, panel, dim)
-    if not image then 
+    local image, rotate, custom_position, panel_screen_rect = self:drawPagePartWithSettings(page, rect, center, panel, dim)
+    if not image then
         logger.warn("DynamicPanelZoom: Could not draw page part")
-        return false 
+        UIManager:show(InfoMessage:new{ text = _("Panel rendering failed — see crash.log"), timeout = 2 })
+        return false
     end
-    
+
     logger.info("DynamicPanelZoom: Successfully created panel image with document settings")
 
-    -- Calculate panel aspect ratio for border logic
-    local panel_aspect_ratio = nil
-    if panel and dim then
-        local panel_w = panel.w * dim.w
-        local panel_h = panel.h * dim.h
-        panel_aspect_ratio = panel_w / panel_h
-        logger.info(string.format("DynamicPanelZoom: Panel aspect ratio: %.3f", panel_aspect_ratio))
-    end
-
     -- Reuse existing viewer if available instead of closing to prevent flash of full page
-    if self._current_imgviewer then 
+    if self._current_imgviewer then
         logger.info("DynamicPanelZoom: Updating existing PanelViewer")
         self._current_imgviewer:updateReadingDirection(self:getEffectiveReadingDirection())
         self._current_imgviewer:updateCustomPosition(custom_position)
-        self._current_imgviewer:updatePanelAspectRatio(panel_aspect_ratio)
         self._current_imgviewer:updateImage(image)
-        self._current_imgviewer:update()
+        if self._current_imgviewer.updatePanelScreenRect then
+            self._current_imgviewer:updatePanelScreenRect(panel_screen_rect)
+        end
+        self:refreshPanelViewer(self._current_imgviewer)
         
         -- Start preloading the next panel after a short delay
         UIManager:scheduleIn(0.2, function()
@@ -1391,7 +1568,7 @@ function PanelZoomIntegration:displayCurrentPanel()
         buttons_visible = false,
         reading_direction = self:getEffectiveReadingDirection(),
         custom_position = custom_position,  -- Pass custom position for center matching
-        panel_aspect_ratio = panel_aspect_ratio,  -- Pass panel aspect ratio for border logic
+        panel_screen_rect = panel_screen_rect,
         onTapRight = function() self:handleTapRight() end,
         onTapLeft = function() self:handleTapLeft() end,
         onClose = function() 
@@ -1400,7 +1577,9 @@ function PanelZoomIntegration:displayCurrentPanel()
             self:restoreOCR()
         end,
         onHold = function()
-            self:switchToZoomMode()
+            if self.hold_to_zoom_enabled then
+                self:switchToZoomMode()
+            end
         end,
     }
     
@@ -1408,14 +1587,9 @@ function PanelZoomIntegration:displayCurrentPanel()
     logger.info("DynamicPanelZoom: Showing new PanelViewer")
     UIManager:show(panel_viewer)
     
-    -- Use "ui" refresh for initial panel display to avoid E-Ink flash.
-    -- "flashui" would cause a visible full-screen flash on E-Ink devices.
-    -- Dithering is still enabled for image quality on grayscale E-Ink displays.
-    UIManager:setDirty(panel_viewer, function()
-        return "ui", panel_viewer.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
-    end)
+    self:refreshPanelViewer(panel_viewer)
     
-    logger.info("DynamicPanelZoom: New PanelViewer shown with flash-free refresh")
+    logger.info("DynamicPanelZoom: New PanelViewer shown")
     
     -- Start preloading the next panel after a short delay
     UIManager:scheduleIn(0.2, function()
@@ -1425,214 +1599,283 @@ function PanelZoomIntegration:displayCurrentPanel()
     return true -- Success, new viewer created
 end
 
--- Integrate reading direction options into existing panel zoom menu
+function PanelZoomIntegration:buildAdvancedOptionsMenu()
+    return {
+        {
+            text = _("Debug Logs"),
+            checked_func = function() return self.debug_log_panels or self.dump_analysis_pgm end,
+            callback = function()
+                self:setDebugLogsEnabled(not (self.debug_log_panels or self.dump_analysis_pgm))
+            end,
+            separator = true,
+        },
+        {
+            text = _("Reading direction"),
+            sub_item_table = {
+                {
+                    text = _("Left-to-Right (LTR)"),
+                    checked_func = function()
+                        return self.reading_direction_override == "ltr" or self.reading_direction_override == nil
+                    end,
+                    callback = function()
+                        self.reading_direction_override = "ltr"
+                        logger.info("DynamicPanelZoom: Reading direction override set to LTR")
+                        self._panel_cache = {}
+                        self.current_panels = {}
+                        self:refreshCurrentPanelIfActive()
+                    end,
+                },
+                {
+                    text = _("Right-to-Left (RTL)"),
+                    checked_func = function()
+                        return self.reading_direction_override == "rtl"
+                    end,
+                    callback = function()
+                        self.reading_direction_override = "rtl"
+                        logger.info("DynamicPanelZoom: Reading direction override set to RTL")
+                        self._panel_cache = {}
+                        self.current_panels = {}
+                        self:refreshCurrentPanelIfActive()
+                    end,
+                },
+            },
+            separator = true,
+        },
+        {
+            text = _("Next panel tap zone"),
+            sub_item_table = {
+                {
+                    text = _("Auto (based on reading direction)"),
+                    checked_func = function() return self.panelzoom_tap_forward_zone == "auto" end,
+                    callback = function()
+                        self.panelzoom_tap_forward_zone = "auto"
+                        logger.info("DynamicPanelZoom: Tap forward zone set to auto")
+                    end,
+                },
+                {
+                    text = _("Left side"),
+                    checked_func = function() return self.panelzoom_tap_forward_zone == "left" end,
+                    callback = function()
+                        self.panelzoom_tap_forward_zone = "left"
+                        logger.info("DynamicPanelZoom: Tap forward zone set to left")
+                    end,
+                },
+                {
+                    text = _("Right side"),
+                    checked_func = function() return self.panelzoom_tap_forward_zone == "right" end,
+                    callback = function()
+                        self.panelzoom_tap_forward_zone = "right"
+                        logger.info("DynamicPanelZoom: Tap forward zone set to right")
+                    end,
+                },
+            },
+            separator = true,
+        },
+        {
+            text = _("Standard panel settings"),
+            sub_item_table = {
+                {
+                    text = _("Show adjacent page content"),
+                    checked_func = function() return self.show_adjacent_panels end,
+                    callback = function()
+                        self.show_adjacent_panels = not self.show_adjacent_panels
+                        self:refreshCurrentPanelIfActive()
+                    end,
+                },
+                {
+                    text = _("Padding around panel"),
+                    sub_item_table = {
+                        {
+                            text = _("0% (None)"),
+                            checked_func = function() return self.standard_margin_percent == 0.0 end,
+                            callback = function() self.standard_margin_percent = 0.0 end,
+                        },
+                        {
+                            text = _("2% (Tight)"),
+                            checked_func = function() return self.standard_margin_percent == 0.02 end,
+                            callback = function() self.standard_margin_percent = 0.02 end,
+                        },
+                        {
+                            text = _("5% (Normal)"),
+                            checked_func = function() return self.standard_margin_percent == 0.05 end,
+                            callback = function() self.standard_margin_percent = 0.05 end,
+                        },
+                        {
+                            text = _("10% (Wide)"),
+                            checked_func = function() return self.standard_margin_percent == 0.10 end,
+                            callback = function() self.standard_margin_percent = 0.10 end,
+                        },
+                    },
+                },
+            },
+            separator = true,
+        },
+        {
+            text = _("Hold-to-zoom settings"),
+            sub_item_table = {
+                {
+                    text = _("Allow panel Zoom"),
+                    checked_func = function() return self.hold_to_zoom_enabled end,
+                    callback = function()
+                        self.hold_to_zoom_enabled = not self.hold_to_zoom_enabled
+                        logger.info("DynamicPanelZoom: Hold-to-zoom set to " .. tostring(self.hold_to_zoom_enabled))
+                    end,
+                    separator = true,
+                },
+                {
+                    text = _("Hold-to-Zoom padding"),
+                    sub_item_table = {
+                        {
+                            text = _("2% (Tight)"),
+                            checked_func = function() return self.zoom_margin_percent == 0.02 end,
+                            callback = function() self.zoom_margin_percent = 0.02 end,
+                        },
+                        {
+                            text = _("5% (Normal)"),
+                            checked_func = function() return self.zoom_margin_percent == 0.05 end,
+                            callback = function() self.zoom_margin_percent = 0.05 end,
+                        },
+                        {
+                            text = _("10% (Wide)"),
+                            checked_func = function() return self.zoom_margin_percent == 0.10 end,
+                            callback = function() self.zoom_margin_percent = 0.10 end,
+                        },
+                        {
+                            text = _("20% (Context)"),
+                            checked_func = function() return self.zoom_margin_percent == 0.20 end,
+                            callback = function() self.zoom_margin_percent = 0.20 end,
+                        },
+                    },
+                },
+                {
+                    text = _("Initial zoom level"),
+                    sub_item_table = {
+                        {
+                            text = _("Fit to screen (1.0x)"),
+                            checked_func = function() return self.zoom_initial_scale == 1.0 end,
+                            callback = function() self.zoom_initial_scale = 1.0 end,
+                        },
+                        {
+                            text = _("Slight Zoom (1.2x)"),
+                            checked_func = function() return self.zoom_initial_scale == 1.2 end,
+                            callback = function() self.zoom_initial_scale = 1.2 end,
+                        },
+                        {
+                            text = _("Medium Zoom (1.5x)"),
+                            checked_func = function() return self.zoom_initial_scale == 1.5 end,
+                            callback = function() self.zoom_initial_scale = 1.5 end,
+                        },
+                        {
+                            text = _("Heavy Zoom (2.0x)"),
+                            checked_func = function() return self.zoom_initial_scale == 2.0 end,
+                            callback = function() self.zoom_initial_scale = 2.0 end,
+                        },
+                    },
+                },
+            },
+            separator = true,
+        },
+        {
+            text = _("Fall back to text selection"),
+            checked_func = function() return self:getFallbackToTextSelection() end,
+            callback = function()
+                self:toggleFallbackToTextSelection()
+            end,
+        },
+    }
+end
+
+function PanelZoomIntegration:buildHowToUseMenu()
+    local function helpRow(text, separator)
+        return {
+            text = text,
+            enabled_func = function() return false end,
+            separator = separator,
+        }
+    end
+
+    return {
+        helpRow(_("Start: long-press a panel on the page."), true),
+        helpRow(_("Next panel: tap the forward side.")),
+        helpRow(_("Previous panel: tap the back side.")),
+        helpRow(_("After last panel: tap forward for next page.")),
+        helpRow(_("Before first panel: tap back for previous page."), true),
+        helpRow(_("Free zoom: long-press while viewing a panel.")),
+        helpRow(_("If taps feel reversed, adjust direction.")),
+        helpRow(_("Or adjust the next panel tap zone."), true),
+        helpRow(_("Tested on Kobo Clara Colour.")),
+        helpRow(_("Optimized for Kobo G2 colour profile."), true),
+        helpRow(_("Koreader defaults when active:")),
+        helpRow(_("Rotation: landscape")),
+        helpRow(_("Page crop: none")),
+        helpRow(_("Page fit: full")),
+        helpRow(_("View mode: page")),
+        helpRow(_("Contrast: 2")),
+        helpRow(_("Dithering: on")),
+    }
+end
+
+function PanelZoomIntegration:buildPanelZoomMenu()
+    return {
+        {
+            text = _("Activate Plugin"),
+            checked_func = function() return self.plugin_enabled end,
+            callback = function()
+                self:setPluginEnabled(not self.plugin_enabled)
+            end,
+            separator = true,
+        },
+        {
+            text = _("How to use"),
+            sub_item_table = self:buildHowToUseMenu(),
+            separator = true,
+        },
+        {
+            text = _("Advanced Options"),
+            sub_item_table = self:buildAdvancedOptionsMenu(),
+        },
+    }
+end
+
+function PanelZoomIntegration:patchPanelZoomMenuItem(menu_items)
+    if not menu_items then return end
+    menu_items.panel_zoom_options = menu_items.panel_zoom_options or {}
+    menu_items.panel_zoom_options.text = _("Advanced Panel Zoom Plugin")
+    menu_items.panel_zoom_options.sub_item_table = self:buildPanelZoomMenu()
+end
+
+function PanelZoomIntegration:addToMainMenu(menu_items)
+    if self.ui and self.ui.paging then
+        self:setupPanelZoomMenuIntegration()
+        self:patchPanelZoomMenuItem(menu_items)
+    end
+end
+
+-- Integrate with KOReader's existing panel zoom menu entry.
 function PanelZoomIntegration:setupPanelZoomMenuIntegration()
-    -- Store original genPanelZoomMenu function
     if not self._original_genPanelZoomMenu and self.ui.highlight and self.ui.highlight.genPanelZoomMenu then
         self._original_genPanelZoomMenu = self.ui.highlight.genPanelZoomMenu
-        
-        -- Override genPanelZoomMenu to include our reading direction options
         self.ui.highlight.genPanelZoomMenu = function()
-            local menu_items = self._original_genPanelZoomMenu(self.ui.highlight)
-            
-            -- Add reading direction submenu at the beginning
-            table.insert(menu_items, 1, {
-                text = _("Reading direction"),
-                sub_item_table = {
-                    {
-                        text = _("Left-to-Right (LTR)"),
-                        checked_func = function()
-                            return self.reading_direction_override == "ltr" or self.reading_direction_override == nil
-                        end,
-                        callback = function()
-                            self.reading_direction_override = "ltr"
-                            logger.info("DynamicPanelZoom: Reading direction override set to LTR")
-                            -- Clear all caches globally so next panel invocation re-sorts
-                            self._panel_cache = {}
-                            self.current_panels = {}
-                            self:refreshCurrentPanelIfActive()
-                        end,
-                    },
-                    {
-                        text = _("Right-to-Left (RTL)"),
-                        checked_func = function()
-                            return self.reading_direction_override == "rtl"
-                        end,
-                        callback = function()
-                            self.reading_direction_override = "rtl"
-                            logger.info("DynamicPanelZoom: Reading direction override set to RTL")
-                            -- Clear all caches globally so next panel invocation re-sorts
-                            self._panel_cache = {}
-                            self.current_panels = {}
-                            self:refreshCurrentPanelIfActive()
-                        end,
-                    },
-                },
-                separator = true,
-            })
-
-            -- Add Tap Zone settings
-            table.insert(menu_items, 2, {
-                text = _("Next panel tap zone"),
-                sub_item_table = {
-                    {
-                        text = _("Auto (based on reading direction)"),
-                        checked_func = function() return self.panelzoom_tap_forward_zone == "auto" end,
-                        callback = function()
-                            self.panelzoom_tap_forward_zone = "auto"
-                            logger.info("DynamicPanelZoom: Tap forward zone set to auto")
-                        end,
-                    },
-                    {
-                        text = _("Left side"),
-                        checked_func = function() return self.panelzoom_tap_forward_zone == "left" end,
-                        callback = function()
-                            self.panelzoom_tap_forward_zone = "left"
-                            logger.info("DynamicPanelZoom: Tap forward zone set to left")
-                        end,
-                    },
-                    {
-                        text = _("Right side"),
-                        checked_func = function() return self.panelzoom_tap_forward_zone == "right" end,
-                        callback = function()
-                            self.panelzoom_tap_forward_zone = "right"
-                            logger.info("DynamicPanelZoom: Tap forward zone set to right")
-                        end,
-                    },
-                },
-                separator = true,
-            })
-
-            -- Add Standard Panel options
-            table.insert(menu_items, 3, {
-                text = _("Standard panel settings"),
-                sub_item_table = {
-                    {
-                        text = _("Show adjacent page content"),
-                        checked_func = function() return self.show_adjacent_panels end,
-                        callback = function()
-                            self.show_adjacent_panels = not self.show_adjacent_panels
-                            self:refreshCurrentPanelIfActive()
-                        end,
-                    },
-                    {
-                        text = _("Padding around panel"),
-                        sub_item_table = {
-                            {
-                                text = _("0% (None)"),
-                                checked_func = function() return self.standard_margin_percent == 0.0 end,
-                                callback = function() self.standard_margin_percent = 0.0 end,
-                            },
-                            {
-                                text = _("2% (Tight)"),
-                                checked_func = function() return self.standard_margin_percent == 0.02 end,
-                                callback = function() self.standard_margin_percent = 0.02 end,
-                            },
-                            {
-                                text = _("5% (Normal)"),
-                                checked_func = function() return self.standard_margin_percent == 0.05 end,
-                                callback = function() self.standard_margin_percent = 0.05 end,
-                            },
-                            {
-                                text = _("10% (Wide)"),
-                                checked_func = function() return self.standard_margin_percent == 0.10 end,
-                                callback = function() self.standard_margin_percent = 0.10 end,
-                            },
-                        }
-                    }
-                },
-                separator = true,
-            })
-            
-            -- Add Free Zoom options
-            table.insert(menu_items, 4, {
-                text = _("Hold-to-Zoom settings"),
-                sub_item_table = {
-                    {
-                        text = _("Hold-to-Zoom padding"),
-                        sub_item_table = {
-                            {
-                                text = _("2% (Tight)"),
-                                checked_func = function() return self.zoom_margin_percent == 0.02 end,
-                                callback = function() self.zoom_margin_percent = 0.02 end,
-                            },
-                            {
-                                text = _("5% (Normal)"),
-                                checked_func = function() return self.zoom_margin_percent == 0.05 end,
-                                callback = function() self.zoom_margin_percent = 0.05 end,
-                            },
-                            {
-                                text = _("10% (Wide)"),
-                                checked_func = function() return self.zoom_margin_percent == 0.10 end,
-                                callback = function() self.zoom_margin_percent = 0.10 end,
-                            },
-                            {
-                                text = _("20% (Context)"),
-                                checked_func = function() return self.zoom_margin_percent == 0.20 end,
-                                callback = function() self.zoom_margin_percent = 0.20 end,
-                            },
-                        }
-                    },
-                    {
-                        text = _("Initial zoom level"),
-                        sub_item_table = {
-                            {
-                                text = _("Fit to screen (1.0x)"),
-                                checked_func = function() return self.zoom_initial_scale == 1.0 end,
-                                callback = function() self.zoom_initial_scale = 1.0 end,
-                            },
-                            {
-                                text = _("Slight Zoom (1.2x)"),
-                                checked_func = function() return self.zoom_initial_scale == 1.2 end,
-                                callback = function() self.zoom_initial_scale = 1.2 end,
-                            },
-                            {
-                                text = _("Medium Zoom (1.5x)"),
-                                checked_func = function() return self.zoom_initial_scale == 1.5 end,
-                                callback = function() self.zoom_initial_scale = 1.5 end,
-                            },
-                            {
-                                text = _("Heavy Zoom (2.0x)"),
-                                checked_func = function() return self.zoom_initial_scale == 2.0 end,
-                                callback = function() self.zoom_initial_scale = 2.0 end,
-                            },
-                        }
-                    },
-                },
-                separator = true,
-            })
-            
-            -- Add Experimental features
-            table.insert(menu_items, 5, {
-                text = _("Experimental features"),
-                sub_item_table = {
-                    {
-                        text = _("Experimental Panel Sorting (Z-pattern)"),
-                        checked_func = function() return self.experimental_panel_sorting_enabled end,
-                        callback = function()
-                            self.experimental_panel_sorting_enabled = not self.experimental_panel_sorting_enabled
-                            logger.info("DynamicPanelZoom: Experimental Panel Sorting set to " .. tostring(self.experimental_panel_sorting_enabled))
-                            -- Invalidate cache so page is re-analyzed
-                            self._panel_cache = {}
-                            self.current_panels = {}
-                            self:refreshCurrentPanelIfActive()
-                        end,
-                    },
-                },
-                separator = true,
-            })
-            
-            return menu_items
+            return self:buildPanelZoomMenu()
         end
-        
-        logger.info("DynamicPanelZoom: Integrated reading direction options into panel zoom menu")
+        logger.info("DynamicPanelZoom: Integrated advanced panel zoom options into KOReader menu")
+    end
+    if not self._original_highlight_addToMainMenu and self.ui.highlight and self.ui.highlight.addToMainMenu then
+        self._original_highlight_addToMainMenu = self.ui.highlight.addToMainMenu
+        self.ui.highlight.addToMainMenu = function(highlight, menu_items)
+            self._original_highlight_addToMainMenu(highlight, menu_items)
+            self:patchPanelZoomMenuItem(menu_items)
+        end
+    end
+    if self.ui and self.ui.menu and self.ui.menu.menu_items then
+        self:patchPanelZoomMenuItem(self.ui.menu.menu_items)
     end
 end
 
 -- Restore original panel zoom menu when plugin is disabled
 function PanelZoomIntegration:restorePanelZoomMenu()
     -- Guard against multiple restoration calls
-    if not self._original_genPanelZoomMenu then
+    if not self._original_genPanelZoomMenu and not self._original_highlight_addToMainMenu then
         return -- Already restored or never stored
     end
     
@@ -1640,6 +1883,10 @@ function PanelZoomIntegration:restorePanelZoomMenu()
         self.ui.highlight.genPanelZoomMenu = self._original_genPanelZoomMenu
         self._original_genPanelZoomMenu = nil
         logger.info("DynamicPanelZoom: Restored original panel zoom menu")
+    end
+    if self._original_highlight_addToMainMenu and self.ui.highlight then
+        self.ui.highlight.addToMainMenu = self._original_highlight_addToMainMenu
+        self._original_highlight_addToMainMenu = nil
     end
 end
 
