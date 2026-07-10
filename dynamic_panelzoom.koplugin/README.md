@@ -4,6 +4,22 @@ Automatic panel-by-panel reading for BD, comics, and manga in KOReader.
 
 This plugin detects panels directly from the rendered page and opens them one at a time in a full-screen panel viewer. It is designed for comfortable comic reading on e-ink devices, especially colour Kobo devices.
 
+## Difference From the Original
+
+The original project by JorgeTheFox introduced the dynamic panel zoom foundation.
+This fork keeps that idea, but shifts the focus to a Kobo Clara Colour optimized
+reading experience for comics, manga, and especially western Bandes dessinees.
+
+The main differences are:
+
+- panel detection tuned against real Kobo Clara Colour device pixels
+- fixes for high-DPI rendered pages, colour dithering, and device refresh behavior
+- advanced e-ink ghosting/remanence cleanup during panel transitions
+- improved handling of western BD layouts and irregular comic panels
+- KOReader defaults applied automatically for this reading mode
+- cleaned KOReader menu with activation, help, debug, and reading controls
+- debug diagnostics kept in KOReader's `crash.log` instead of sidecar files
+
 ## Tested Device
 
 This plugin has been tested and optimized for:
