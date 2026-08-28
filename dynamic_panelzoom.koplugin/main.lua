@@ -14,6 +14,7 @@ local logger = require("logger")
 -- Long side of the downscaled render used for panel analysis.
 -- Keep in sync with ANALYSIS_PX in test/run_tests.py.
 local ANALYSIS_TARGET_PX = 1300
+local BASIC_BOUNDS_TARGET_PX = 640
 local PANEL_CLEAR_REFRESH_MODE = "flashui"
 local PANEL_DRAW_REFRESH_MODE = "ui"
 local PANEL_CLEAR_EPDC_SLEEP_US = 0
@@ -21,7 +22,19 @@ local PANEL_CLEAR_LUMA = 128
 local PANEL_FORCE_DRAW_REPAINT = false
 local PANEL_DIRECT_CLEAR = true
 local PANEL_FULL_SCREEN_TRANSITION = true
-local PANEL_SINGLE_FULL_DRAW = false
+-- A single native full refresh paints the final panel through KOReader's
+-- normal widget pipeline. It keeps the strong ghost-cleaning waveform while
+-- avoiding the old blocking gray flash followed by a second color update.
+local PANEL_SINGLE_FULL_DRAW = true
+local PANEL_SINGLE_REFRESH_MODE = "full"
+-- Start lookahead while the current e-ink transition is still settling, so
+-- the next panel is normally ready before the reader taps again. The preload
+-- remains cancellable and identity-checked.
+local PANEL_PRELOAD_IDLE_DELAY = 0.20
+local PANEL_CHAINED_PRELOAD_DELAY = 0.10
+-- Keep the legacy key so existing users retain their enabled/disabled choice
+-- when the mode moves from three to four detail views.
+local BASIC_THREE_PANEL_SETTING = "advanced_panel_zoom_basic_three_panel_mode"
 
 local READER_DEFAULTS = {
     rotation_mode = Screen.DEVICE_ROTATED_COUNTER_CLOCKWISE,
@@ -46,6 +59,10 @@ local PanelZoomIntegration = WidgetContainer:extend{
     _preloaded_image = nil, -- Pre-rendered next panel
     _preloaded_panel_index = nil, -- Index of preloaded panel
     _preloaded_panel_screen_rect = nil,
+    _preloaded_key = nil,
+    _preload_action = nil,
+    _preload_generation = 0,
+    _panel_layout_generation = 0,
     _is_switching = false, -- Debounce guard to prevent fast tap issues
     _is_changing_page = false, -- True while a page change is in progress
     _page_change_diff = nil, -- Direction of current page change (+1 or -1)
@@ -68,9 +85,21 @@ local PanelZoomIntegration = WidgetContainer:extend{
     apply_koreader_defaults = true,
     plugin_enabled = true,
     hold_to_zoom_enabled = true,
+    basic_three_panel_mode = false,
+    single_giant_detail_enabled = true,
+    single_giant_detail_count = 4,
+    single_giant_detail_min_area = 0.55,
+    single_giant_detail_min_w = 0.70,
+    single_giant_detail_min_h = 0.50,
 }
 
 function PanelZoomIntegration:init()
+    self.current_panels = {}
+    self._panel_cache = {}
+    self._preload_generation = 0
+    self._panel_layout_generation = 0
+    self._preload_action = nil
+    self._preloaded_key = nil
     -- Everything goes to crash.log (via KOReader's logger). We create NO
     -- separate log files: crash.log survives restarts, so dumped diagnostics
     -- cannot be lost, and there is a single file to hand over.
@@ -79,6 +108,10 @@ function PanelZoomIntegration:init()
     -- logs and embedded PGM dumps go to crash.log; no sidecar files are used.
     self.debug_log_panels = false
     self.dump_analysis_pgm = false
+    if G_reader_settings and G_reader_settings.readSetting then
+        self.basic_three_panel_mode = G_reader_settings:readSetting(
+            BASIC_THREE_PANEL_SETTING, false) == true
+    end
 
     -- ReaderReady is KOReader's real "document is loaded and rendered" event.
     self.onReaderReady = function()
@@ -95,6 +128,7 @@ function PanelZoomIntegration:init()
         if self._is_changing_page then
             self:_onPageChangeComplete(new_page_no)
         else
+            self:cancelPanelPreload()
             self:applyPreferredReaderDefaults()
             self:checkAndIntegratePanelZoom()
         end
@@ -104,6 +138,7 @@ function PanelZoomIntegration:init()
     self.onSettingsUpdate = function()
         if self._current_imgviewer and self.integration_mode then
             logger.info("PanelZoom: Settings changed, refreshing current panel")
+            self:cancelPanelPreload()
             self:displayCurrentPanel()
         end
     end
@@ -347,13 +382,13 @@ function PanelZoomIntegration:setDebugLogsEnabled(enabled)
     self.dump_analysis_pgm = enabled
     logger.info("DynamicPanelZoom: Debug logs set to " .. tostring(enabled))
     self._panel_cache = {}
-    self.current_panels = {}
+    self:replaceCurrentPanels({})
 end
 
 function PanelZoomIntegration:setPluginEnabled(enabled)
     self.plugin_enabled = enabled
     self._panel_cache = {}
-    self.current_panels = {}
+    self:replaceCurrentPanels({})
 
     if enabled then
         logger.info("DynamicPanelZoom: Plugin activated")
@@ -376,6 +411,23 @@ function PanelZoomIntegration:setPluginEnabled(enabled)
         end
     end
     self:restoreOCR()
+end
+
+function PanelZoomIntegration:setBasicThreePanelMode(enabled)
+    self.basic_three_panel_mode = enabled == true
+    saveGlobalSetting(BASIC_THREE_PANEL_SETTING, self.basic_three_panel_mode)
+    self._panel_cache = {}
+    self:replaceCurrentPanels({})
+    self.current_panel_index = 1
+
+    logger.info("DynamicPanelZoom: Basic 4 Panels Mode set to "
+        .. tostring(self.basic_three_panel_mode))
+
+    if self._current_imgviewer and self.integration_mode then
+        self:importToggleZoomPanels()
+        self.current_panel_index = 1
+        self:displayCurrentPanel()
+    end
 end
 
 function PanelZoomIntegration:getFallbackToTextSelection()
@@ -417,10 +469,10 @@ function PanelZoomIntegration:handleTapRight()
     if intent_forward then
         -- Forward Flow
         -- Check preload first for Next
-        if self._preloaded_image and self._preloaded_panel_index == self.current_panel_index + 1 then
+        if self:hasValidPreloadedPanel(self.current_panel_index + 1) then
             logger.info("PanelZoom: Using preloaded panel for instant switch (Forward)")
             self.current_panel_index = self.current_panel_index + 1
-            self:displayPreloadedPanel()
+            if not self:displayPreloadedPanel() then self:displayCurrentPanel() end
             return
         end
         
@@ -469,10 +521,10 @@ function PanelZoomIntegration:handleTapLeft()
     if intent_forward then
         -- Forward Flow
         -- Check preload first for Next
-        if self._preloaded_image and self._preloaded_panel_index == self.current_panel_index + 1 then
+        if self:hasValidPreloadedPanel(self.current_panel_index + 1) then
             logger.info("PanelZoom: Using preloaded panel for instant switch (Forward)")
             self.current_panel_index = self.current_panel_index + 1
-            self:displayPreloadedPanel()
+            if not self:displayPreloadedPanel() then self:displayCurrentPanel() end
             return
         end
         
@@ -497,7 +549,66 @@ function PanelZoomIntegration:handleTapLeft()
     end
 end
 
+local function preloadKeysEqual(a, b)
+    return a ~= nil and b ~= nil
+        and a.doc_path == b.doc_path
+        and a.page == b.page
+        and a.layout_generation == b.layout_generation
+        and a.reading_direction == b.reading_direction
+        and a.basic_three_panel_mode == b.basic_three_panel_mode
+        and a.standard_margin_percent == b.standard_margin_percent
+        and a.show_adjacent_panels == b.show_adjacent_panels
+        and a.panel_index == b.panel_index
+        and a.viewer == b.viewer
+end
+
+function PanelZoomIntegration:makePanelPreloadKey(panel_index)
+    if not self.ui or not self.ui.document or not self._current_imgviewer then return nil end
+    return {
+        doc_path = self.ui.document.file or tostring(self.ui.document),
+        page = self:getSafePageNumber(),
+        layout_generation = self._panel_layout_generation or 0,
+        reading_direction = self:getEffectiveReadingDirection(),
+        basic_three_panel_mode = self.basic_three_panel_mode == true,
+        standard_margin_percent = self.standard_margin_percent or 0,
+        show_adjacent_panels = self.show_adjacent_panels == true,
+        panel_index = panel_index,
+        viewer = self._current_imgviewer,
+    }
+end
+
+function PanelZoomIntegration:preloadContextMatches(key)
+    if not key or not self.plugin_enabled or not self.integration_mode then return false end
+    local current = self:makePanelPreloadKey(key.panel_index)
+    return preloadKeysEqual(key, current)
+end
+
+function PanelZoomIntegration:cancelPanelPreload()
+    self._preload_generation = (self._preload_generation or 0) + 1
+    if self._preload_action then
+        UIManager:unschedule(self._preload_action)
+        self._preload_action = nil
+    end
+    self:cleanupPreloadedImage()
+end
+
+function PanelZoomIntegration:replaceCurrentPanels(panels)
+    self:cancelPanelPreload()
+    self._panel_layout_generation = (self._panel_layout_generation or 0) + 1
+    self.current_panels = panels or {}
+end
+
+function PanelZoomIntegration:hasValidPreloadedPanel(panel_index)
+    if not self._preloaded_image then return false end
+    local expected = self:makePanelPreloadKey(panel_index)
+    if preloadKeysEqual(self._preloaded_key, expected) then return true end
+    logger.info("DynamicPanelZoom: Discarding stale preloaded panel")
+    self:cleanupPreloadedImage()
+    return false
+end
+
 function PanelZoomIntegration:closeViewer()
+    self:cancelPanelPreload()
     if self._current_imgviewer then
         -- Ensure E-Ink refresh suppression is restored if we were mid-page-change
         if UIManager.currently_scrolling then
@@ -505,7 +616,6 @@ function PanelZoomIntegration:closeViewer()
         end
         UIManager:close(self._current_imgviewer)
         self._current_imgviewer = nil
-        self:cleanupPreloadedImage()
         -- Restore OCR when panel viewer is closed
         self:restoreOCR()
     end
@@ -516,55 +626,80 @@ function PanelZoomIntegration:closeViewer()
     self._page_change_diff = nil
 end
 
--- Preload the next panel in background
-function PanelZoomIntegration:preloadNextPanel()
-    -- Clean up any existing preloaded image
-    self:cleanupPreloadedImage()
-    
-    local reading_dir = self:getEffectiveReadingDirection()
-    local is_rtl = reading_dir == "rtl"
-    
-    -- In absolute terms, "next" means index+1 (if LTR) or index-1 (if RTL)
-    -- Actually, wait: the index IS correctly sorted in importToggleZoomPanels based on reading direction!
-    -- Yes, the array is ALWAYS sorted so that index 1 is the START and index N is the END of the page.
-    -- So "next panel in logical reading order" is always index + 1!
+-- KOReader has no safe worker-thread API for document rendering. Delay the
+-- one-panel lookahead until the reader has been idle, and make it cancellable.
+function PanelZoomIntegration:scheduleNextPanelPreload(delay)
     local next_panel_index = self.current_panel_index + 1
-    
-    -- Check if there's a next panel to preload
-    if next_panel_index <= #self.current_panels then
-        local next_panel = self.current_panels[next_panel_index]
-        
-        if next_panel then
-            logger.info(string.format("DynamicPanelZoom: Preloading panel %d in background", next_panel_index))
-            
-            local page = self:getSafePageNumber()
-            local dim = self.ui.document:getNativePageDimensions(page)
-            
-            if dim then
-                -- Calculate and log panel center coordinates for preloaded panel
-                local center = self:calculatePanelCenter(next_panel, dim)
-                
-                -- Use helper function for center-preserving quantization
-                local margin = self.standard_margin_percent or 0.0
-                local rect = self:panelToRect(next_panel, dim, margin)
-                
-                -- Render the next panel with document settings (standard margins for preloading)
-                local image, rotate, custom_position, panel_screen_rect = self:drawPagePartWithSettings(page, rect, center, next_panel, dim)
-                -- Store preloaded image with panel data for proper centering
-                if image then
-                    self._preloaded_image = image
-                    self._preloaded_panel_index = next_panel_index
-                    self._preloaded_panel = next_panel  -- Store panel data
-                    self._preloaded_dim = dim          -- Store dimensions
-                    self._preloaded_custom_position = custom_position  -- Store calculated position
-                    self._preloaded_panel_screen_rect = panel_screen_rect
-                    logger.info("DynamicPanelZoom: Successfully preloaded next panel with document settings")
-                else
-                    logger.warn("DynamicPanelZoom: Failed to preload next panel")
-                end
-            end
-        end
+    if next_panel_index > #self.current_panels then
+        self:cancelPanelPreload()
+        return
     end
+
+    local key = self:makePanelPreloadKey(next_panel_index)
+    if not key then
+        self:cancelPanelPreload()
+        return
+    end
+    if self._preloaded_image and preloadKeysEqual(self._preloaded_key, key) then return end
+
+    if self._preload_action then
+        UIManager:unschedule(self._preload_action)
+        self._preload_action = nil
+    end
+    self._preload_generation = (self._preload_generation or 0) + 1
+    self:cleanupPreloadedImage()
+    local generation = self._preload_generation
+    local action
+    action = function()
+        if self._preload_action == action then self._preload_action = nil end
+        if generation ~= self._preload_generation
+            or not self:preloadContextMatches(key)
+            or self.current_panel_index + 1 ~= key.panel_index then
+            return
+        end
+        self:preloadNextPanel(key)
+    end
+    self._preload_action = action
+    UIManager:scheduleIn(delay or PANEL_PRELOAD_IDLE_DELAY, action)
+end
+
+function PanelZoomIntegration:preloadNextPanel(key)
+    if not self:preloadContextMatches(key)
+        or self.current_panel_index + 1 ~= key.panel_index then
+        return false
+    end
+
+    local next_panel = self.current_panels[key.panel_index]
+    if not next_panel then return false end
+    logger.info(string.format("DynamicPanelZoom: Idle-preloading panel %d", key.panel_index))
+
+    local dim = self.ui.document:getNativePageDimensions(key.page)
+    if not dim then return false end
+    local center = self:calculatePanelCenter(next_panel, dim)
+    local margin = self.standard_margin_percent or 0.0
+    local rect = self:panelToRect(next_panel, dim, margin)
+    local image, _, custom_position, panel_screen_rect =
+        self:drawPagePartWithSettings(key.page, rect, center, next_panel, dim)
+    if not image then
+        logger.warn("DynamicPanelZoom: Failed to idle-preload next panel")
+        return false
+    end
+
+    if not self:preloadContextMatches(key)
+        or self.current_panel_index + 1 ~= key.panel_index then
+        if image.free then image:free() end
+        return false
+    end
+
+    self._preloaded_image = image
+    self._preloaded_panel_index = key.panel_index
+    self._preloaded_panel = next_panel
+    self._preloaded_dim = dim
+    self._preloaded_custom_position = custom_position
+    self._preloaded_panel_screen_rect = panel_screen_rect
+    self._preloaded_key = key
+    logger.info("DynamicPanelZoom: Successfully idle-preloaded next panel")
+    return true
 end
 
 function PanelZoomIntegration:refreshPanelViewer(panel_viewer)
@@ -595,9 +730,10 @@ function PanelZoomIntegration:refreshPanelViewer(panel_viewer)
     local draw_pct = (draw_region.w * draw_region.h * 100) / screen_area
 
     logger.info(string.format(
-        "DynamicPanelZoom: Performing transition refresh clear_mode=%s draw_mode=%s luma=%d direct=%s force_draw=%s full_screen=%s single_full_draw=%s clear=%d,%d %dx%d area=%.1f%% draw=%d,%d %dx%d area=%.1f%%",
+        "DynamicPanelZoom: Performing transition refresh clear_mode=%s draw_mode=%s single_mode=%s luma=%d direct=%s force_draw=%s full_screen=%s single_full_draw=%s clear=%d,%d %dx%d area=%.1f%% draw=%d,%d %dx%d area=%.1f%%",
         PANEL_CLEAR_REFRESH_MODE,
         PANEL_DRAW_REFRESH_MODE,
+        PANEL_SINGLE_REFRESH_MODE,
         PANEL_CLEAR_LUMA,
         tostring(PANEL_DIRECT_CLEAR),
         tostring(PANEL_FORCE_DRAW_REPAINT),
@@ -610,9 +746,13 @@ function PanelZoomIntegration:refreshPanelViewer(panel_viewer)
 
     if PANEL_SINGLE_FULL_DRAW
         and PANEL_FULL_SCREEN_TRANSITION then
+        local refresh_dither = Screen.sw_dithering
+            or (self.ui and self.ui.document and self.ui.document.hw_dithering)
         panel_viewer:setClearOnly(false)
-        panel_viewer:update(PANEL_CLEAR_REFRESH_MODE, draw_region, Screen.sw_dithering)
-        logger.info("DynamicPanelZoom: Queued final panel with single full refresh")
+        panel_viewer:update(PANEL_SINGLE_REFRESH_MODE, nil, refresh_dither)
+        logger.info(string.format(
+            "DynamicPanelZoom: Queued final panel with single %s refresh dither=%s",
+            PANEL_SINGLE_REFRESH_MODE, tostring(refresh_dither)))
         return
     end
 
@@ -653,7 +793,8 @@ end
 
 -- Display preloaded panel instantly
 function PanelZoomIntegration:displayPreloadedPanel()
-    if not self._preloaded_image or not self._current_imgviewer then
+    if not self._current_imgviewer
+        or not self:hasValidPreloadedPanel(self.current_panel_index) then
         logger.warn("DynamicPanelZoom: No preloaded image or viewer available")
         return false
     end
@@ -695,11 +836,9 @@ function PanelZoomIntegration:displayPreloadedPanel()
     self._preloaded_dim = nil
     self._preloaded_custom_position = nil
     self._preloaded_panel_screen_rect = nil
+    self._preloaded_key = nil
     
-    -- Start preloading the next panel
-    UIManager:scheduleIn(0.1, function()
-        self:preloadNextPanel()
-    end)
+    self:scheduleNextPanelPreload(PANEL_CHAINED_PRELOAD_DELAY)
     
     return true
 end
@@ -715,8 +854,12 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_cente
     local screen_w = Screen:getWidth()
     local screen_h = Screen:getHeight()
 
-    -- 2. DEFINE ABSOLUTE LIMIT SAFE ZONE
-    local padding = 5
+    -- Giant-panel overview/detail sequences own the whole screen. Their
+    -- detail slices must fill the physical width without the normal 5px
+    -- safety border; regular dynamically detected panels keep it.
+    local giant_panel_step = panel and panel.giant_panel_mode ~= nil
+    local force_width_fill = panel and panel.giant_panel_mode == "detail"
+    local padding = giant_panel_step and 0 or 5
     local safe_w = screen_w - (padding * 2)
     local safe_h = screen_h - (padding * 2)
 
@@ -728,7 +871,7 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_cente
     else
         local scale_w = safe_w / rect.w
         local scale_h = safe_h / rect.h
-        final_scale = math.min(scale_w, scale_h)
+        final_scale = force_width_fill and scale_w or math.min(scale_w, scale_h)
     end
 
     -- Calculate final display dimensions
@@ -741,7 +884,8 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_cente
     local pos_y = (screen_h - display_h) / 2
 
     -- 5. CLAMPING TO ABSOLUTE LIMITS
-    -- Forces the panel to stay at least 5px from any edge
+    -- Regular panels keep their safety border; giant-panel steps may touch
+    -- the screen edges and detail slices are positioned flush left/right.
     local custom_position = {
         x = math.floor(math.max(padding, math.min(pos_x, screen_w - display_w - padding)) + 0.5),
         y = math.floor(math.max(padding, math.min(pos_y, screen_h - display_h - padding)) + 0.5)
@@ -800,8 +944,10 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_cente
             image:invert()
         end
         
-        logger.info(string.format("DynamicPanelZoom: [Safe Zone %dpx] Rendered %dx%d at (%d,%d)", 
-            padding, display_w, display_h, custom_position.x, custom_position.y))
+        logger.info(string.format(
+            "DynamicPanelZoom: [Safe Zone %dpx edge_to_edge=%s width_fill=%s] Rendered %dx%d at (%d,%d)",
+            padding, tostring(giant_panel_step), tostring(force_width_fill),
+            display_w, display_h, custom_position.x, custom_position.y))
     end
 
     return image, false, custom_position, panel_screen_rect
@@ -853,6 +999,7 @@ function PanelZoomIntegration:cleanupPreloadedImage()
     self._preloaded_dim = nil
     self._preloaded_custom_position = nil
     self._preloaded_panel_screen_rect = nil
+    self._preloaded_key = nil
 end
 
 function PanelZoomIntegration:changePage(diff)
@@ -861,8 +1008,8 @@ function PanelZoomIntegration:changePage(diff)
     -- while KOReader renders the new full page in the background, 
     -- preventing the "flash of full page" spoiler.
 
-    -- Clear preloaded cache immediately to prevent ghost images
-    self:cleanupPreloadedImage()
+    -- Cancel lookahead work immediately so it cannot cross a page boundary.
+    self:cancelPanelPreload()
 
     -- Save current state for the event-driven flow
     self._is_changing_page = true
@@ -1013,7 +1160,7 @@ function PanelZoomIntegration:importToggleZoomPanels()
     -- Check if we already have panels for this page cached in memory FOR THIS READING DIR
     if self._panel_cache[doc_path][reading_dir][page_idx] then
         logger.info(string.format("DynamicPanelZoom: Using cached %s panels for page %d", reading_dir, page_idx))
-        self.current_panels = self._panel_cache[doc_path][reading_dir][page_idx]
+        self:replaceCurrentPanels(self._panel_cache[doc_path][reading_dir][page_idx])
         return
     end
     
@@ -1024,7 +1171,7 @@ function PanelZoomIntegration:importToggleZoomPanels()
     UIManager:show(analyzing_msg)
     UIManager:forceRePaint()
     local panels, analysis_error = self:analyzePageForPanels(page_idx)
-    self.current_panels = panels
+    self:replaceCurrentPanels(panels)
     UIManager:close(analyzing_msg)
 
     -- Cache the layout — but never cache an error fallback, so a transient
@@ -1040,7 +1187,7 @@ function PanelZoomIntegration:importToggleZoomPanels()
     end
 end
 
-function PanelZoomIntegration:_extractRawBoxes(pageno)
+function PanelZoomIntegration:_extractRawBoxes(pageno, bounds_only)
     local ffi = require("ffi")
     local time_start = os.clock()
 
@@ -1071,7 +1218,8 @@ function PanelZoomIntegration:_extractRawBoxes(pageno)
     -- getNativePageDimensions returns POINTS for image-based documents (a
     -- 1920px CBZ page reports ~461), so the zoom may legitimately exceed 1.0:
     -- MuPDF then samples the full-resolution source down to our target size.
-    local scale = ANALYSIS_TARGET_PX / math.max(page_size.w, page_size.h)
+    local analysis_target = bounds_only and BASIC_BOUNDS_TARGET_PX or ANALYSIS_TARGET_PX
+    local scale = analysis_target / math.max(page_size.w, page_size.h)
     scale = math.min(scale, 4.0)
     kc:setZoom(scale)
 
@@ -1133,29 +1281,215 @@ function PanelZoomIntegration:_extractRawBoxes(pageno)
             self:dumpAnalysisPGM(pageno, pix, w, h)
         end
 
-        return PanelDetect.detect(pix, w, h)
+        if bounds_only then
+            return PanelDetect.findContentBounds(pix, w, h)
+        end
+
+        local detected, detection_info = PanelDetect.detect(pix, w, h)
+        if #detected == 1 then
+            local p = detected[1]
+            if p.x <= 0.015 and p.x + p.w >= 0.985 then
+                local bounds = PanelDetect.findContentBounds(pix, w, h)
+                p.overview_x = bounds.x
+                p.overview_y = bounds.y
+                p.overview_w = bounds.w
+                p.overview_h = bounds.h
+                p.detail_x = bounds.x
+                p.detail_y = bounds.y
+                p.detail_w = bounds.w
+                p.detail_h = bounds.h
+            end
+        end
+        return detected, detection_info
     end)
 
     page:close()
     if kc.free then kc:free() end
 
     if not ok then
-        logger.err("DynamicPanelZoom: panel detection failed: " .. tostring(panels))
+        logger.err("DynamicPanelZoom: analysis failed: " .. tostring(panels))
+        if bounds_only then
+            return { x = 0, y = 0, w = 1, h = 1 }, true
+        end
         return { { x = 0, y = 0, w = 1, h = 1 } }, true
     end
 
+    if bounds_only then
+        logger.info(string.format(
+            "DynamicPanelZoom: artwork bounds x=%.3f y=%.3f w=%.3f h=%.3f in %.0f ms",
+            panels.x, panels.y, panels.w, panels.h,
+            (os.clock() - time_start) * 1000))
+        return panels, false
+    end
+
     logger.info(string.format(
-        "DynamicPanelZoom: detected %d panels in %.0f ms (bg=%d tol=%.3f raw=%d coverage=%.2f fallback=%s)",
+        "DynamicPanelZoom: detected %d panels in %.0f ms (bg=%d tol=%.3f raw=%d union=%.2f sum=%.2f max_iou=%.2f confidence=%s fallback=%s reason=%s rescue=%s attempts=%d regions=%d)",
         #panels, (os.clock() - time_start) * 1000,
         info.background or -1, info.tolerance_used or -1, info.raw_count or -1,
-        info.coverage or 0, tostring(info.fallback)))
+        info.union_coverage or info.coverage or 0, info.sum_coverage or 0,
+        info.max_iou or 0, tostring(info.confidence or "unknown"),
+        tostring(info.fallback), tostring(info.fallback_reason or "none"),
+        tostring(info.structural_rescue_kind or "none"),
+        info.structural_rescue_attempts or 0,
+        info.structural_rescue_regions or 0))
 
     return panels
 end
 
+function PanelZoomIntegration:expandSingleGiantPanelSequence(panels, page_aspect)
+    if not self.single_giant_detail_enabled or #panels == 0 then
+        return panels
+    end
+
+    local function area(p)
+        return (p.w or 0) * (p.h or 0)
+    end
+
+    local function isGiant(p)
+        return area(p) >= self.single_giant_detail_min_area
+            and (p.w or 0) >= self.single_giant_detail_min_w
+            and (p.h or 0) >= self.single_giant_detail_min_h
+    end
+
+    local function makeSequence(p)
+        local count = math.max(1, math.floor((self.single_giant_detail_count or 4) + 0.5))
+        local detail_x = p.detail_x or p.x
+        local detail_y = p.detail_y or p.y
+        local detail_w = p.detail_w or p.w
+        local detail_h = p.detail_h or p.h
+        local screen_aspect = Screen:getWidth() / math.max(1, Screen:getHeight())
+        local detail_views, sweep = PanelDetect.buildDetailViews({
+            x = detail_x, y = detail_y, w = detail_w, h = detail_h,
+        }, count, page_aspect, screen_aspect, self:getEffectiveReadingDirection())
+        local overview_x = p.overview_x or p.x
+        local overview_y = p.overview_y or p.y
+        local overview_w = p.overview_w or p.w
+        local overview_h = p.overview_h or p.h
+        local out = {
+            {
+                x = overview_x,
+                y = overview_y,
+                w = overview_w,
+                h = overview_h,
+                giant_panel_mode = "full",
+            },
+        }
+        for i = 1, count do
+            local view = detail_views[i]
+            out[#out + 1] = {
+                x = view.x,
+                y = view.y,
+                w = view.w,
+                h = view.h,
+                giant_panel_mode = "detail",
+                giant_panel_slice = i,
+            }
+        end
+        logger.info(string.format(
+            "DynamicPanelZoom: Expanded giant panel area=%.2f into trimmed overview + %d screen-filling detail views (%s sweep)",
+            area(p), count, sweep))
+        return out
+    end
+
+    if #panels == 1 then
+        return isGiant(panels[1]) and makeSequence(panels[1]) or panels
+    end
+
+    local giant_i = 1
+    for i = 2, #panels do
+        if area(panels[i]) > area(panels[giant_i]) then giant_i = i end
+    end
+    local giant = panels[giant_i]
+    if not isGiant(giant) or #panels > 3 then return panels end
+
+    -- One short banner followed by an enormous lower composite: preserve the
+    -- banner, then make the unreadable composite navigable at full width.
+    if #panels == 2 then
+        local other_i = giant_i == 1 and 2 or 1
+        local other = panels[other_i]
+        local vertical_gap = giant.y - (other.y + other.h)
+        local x0 = math.min(giant.x, other.x)
+        local y0 = math.min(giant.y, other.y)
+        local x1 = math.max(giant.x + giant.w, other.x + other.w)
+        local y1 = math.max(giant.y + giant.h, other.y + other.h)
+
+        -- Cover/title pages often appear as one short title region followed
+        -- by one near-full-page image. Treat the pair as one page so the
+        -- automatic fallback matches Basic 4 Panels Mode: overview, then
+        -- four screen-filling detail views.
+        if area(giant) >= 0.65 and giant.h >= 0.68
+            and giant.x <= 0.02 and giant.y + giant.h >= 0.98
+            and other.w >= 0.75 and other.h >= 0.15 and other.h <= 0.28
+            and other.y <= giant.y and vertical_gap >= -0.02 and vertical_gap <= 0.04
+            and y1 - y0 >= 0.90 and (x1 - x0) * (y1 - y0) >= 0.85 then
+            return makeSequence({
+                x = 0, y = 0, w = 1, h = 1,
+                detail_x = x0,
+                detail_y = y0,
+                detail_w = x1 - x0,
+                detail_h = y1 - y0,
+            })
+        end
+
+        if area(giant) >= 0.65 and giant.h >= 0.70
+            and other.w >= 0.75 and other.h <= 0.25
+            and other.y <= giant.y and vertical_gap <= 0.04 then
+            local out = { other }
+            for _, p in ipairs(makeSequence(giant)) do out[#out + 1] = p end
+            return out
+        end
+        return panels
+    end
+
+    -- One dominant picture with two small embedded/inset detections is more
+    -- useful as a single overview plus detail slices than as three odd crops.
+    local extras_small = true
+    local x0, y0 = giant.x, giant.y
+    local x1, y1 = giant.x + giant.w, giant.y + giant.h
+    for i, p in ipairs(panels) do
+        if i ~= giant_i then
+            local gap = p.y - (giant.y + giant.h)
+            if area(p) > 0.12 or gap > 0.05 then extras_small = false end
+            x0, y0 = math.min(x0, p.x), math.min(y0, p.y)
+            x1, y1 = math.max(x1, p.x + p.w), math.max(y1, p.y + p.h)
+        end
+    end
+    local union = { x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
+    if extras_small and area(union) >= 0.65 then
+        return makeSequence(union)
+    end
+    return panels
+end
+
 function PanelZoomIntegration:analyzePageForPanels(pageno)
+    local page_dim = self.ui.document:getNativePageDimensions(pageno)
+        or self.ui.document:getPageSize(pageno)
+    local page_aspect = page_dim and page_dim.h > 0
+        and page_dim.w / page_dim.h or 1
+    if self.basic_three_panel_mode then
+        logger.info(string.format(
+            "DynamicPanelZoom: Basic 4 Panels Mode active for page %d; scanning artwork bounds only",
+            pageno))
+        local bounds, bounds_error = self:_extractRawBoxes(pageno, true)
+        return self:expandSingleGiantPanelSequence({
+            {
+                x = 0, y = 0, w = 1, h = 1,
+                overview_x = bounds.x,
+                overview_y = bounds.y,
+                overview_w = bounds.w,
+                overview_h = bounds.h,
+                detail_x = bounds.x,
+                detail_y = bounds.y,
+                detail_w = bounds.w,
+                detail_h = bounds.h,
+            },
+        }, page_aspect), bounds_error
+    end
+
     local panels, analysis_error = self:_extractRawBoxes(pageno)
     panels = PanelDetect.sort(panels, self:getEffectiveReadingDirection())
+    panels = self:expandSingleGiantPanelSequence(panels, page_aspect)
+    panels = PanelDetect.addDisplayEdgeSafety(panels)
 
     if self.debug_log_panels then
         for i, p in ipairs(panels) do
@@ -1294,8 +1628,13 @@ function PanelZoomIntegration:panelToRect(panel, dim, apply_margin_percent)
     local right_extension = 0
     local top_extension = 0
     local bottom_extension = 0
+    local exact_detail_crop = panel.giant_panel_mode == "detail"
 
-    if apply_margin_percent and apply_margin_percent > 0 then
+    if exact_detail_crop then
+        -- Four-view detail crops already match the physical screen aspect and
+        -- the detected artwork bounds. Expanding them would bring page
+        -- whitespace back into view or create a visible screen band.
+    elseif apply_margin_percent and apply_margin_percent > 0 then
         -- Zoom mode (or standard mode with custom margins): Apply constant absolute margin based on page size
         local base_dimension = math.max(dim.w, dim.h)
         local constant_margin = math.floor(base_dimension * apply_margin_percent + 0.5)
@@ -1327,7 +1666,7 @@ function PanelZoomIntegration:panelToRect(panel, dim, apply_margin_percent)
     render_rect.y = math.max(0, math.min(render_rect.y, dim.h - render_rect.h))
 
     -- Step 3: Smart Fill (Aspect Ratio Expansion)
-    if self.show_adjacent_panels then
+    if self.show_adjacent_panels and not exact_detail_crop then
         local screen_width = Screen:getWidth()
         local screen_height = Screen:getHeight()
         -- Handle landscape mode if orientation changed
@@ -1407,6 +1746,7 @@ function PanelZoomIntegration:switchToZoomMode()
     local page = self:getSafePageNumber()
     local dim = self.ui.document:getNativePageDimensions(page) or self.ui.document:getPageSize(page)
     if not dim then return false end
+    self:cancelPanelPreload()
 
     -- 1. Get expanded rect (margin for reading text that spills out)
     local margin = self.zoom_margin_percent or 0.05
@@ -1450,10 +1790,14 @@ function PanelZoomIntegration:switchToZoomMode()
     -- First, calculate what the scale was in the normal PanelViewer:
     local standard_margin = self.standard_margin_percent or 0.0
     local normal_rect = self:panelToRect(panel, dim, standard_margin) -- Rect with standard panel margins
-    local padding = 5
+    local giant_panel_step = panel and panel.giant_panel_mode ~= nil
+    local force_width_fill = panel and panel.giant_panel_mode == "detail"
+    local padding = giant_panel_step and 0 or 5
     local safe_w = screen_w - (padding * 2)
     local safe_h = screen_h - (padding * 2)
-    local normal_scale = math.min(safe_w / normal_rect.w, safe_h / normal_rect.h)
+    local normal_scale = force_width_fill
+        and (safe_w / normal_rect.w)
+        or math.min(safe_w / normal_rect.w, safe_h / normal_rect.h)
     
     -- The absolute scale we want to achieve on the physical screen (1 pixel image = 1 pixel screen at 1.0x)
     local target_absolute_scale = normal_scale / safe_scale
@@ -1546,6 +1890,7 @@ function PanelZoomIntegration:displayCurrentPanel()
     if self._current_imgviewer then
         logger.info("DynamicPanelZoom: Updating existing PanelViewer")
         self._current_imgviewer:updateReadingDirection(self:getEffectiveReadingDirection())
+        self._current_imgviewer:updateBasicThreePanelMode(self.basic_three_panel_mode)
         self._current_imgviewer:updateCustomPosition(custom_position)
         self._current_imgviewer:updateImage(image)
         if self._current_imgviewer.updatePanelScreenRect then
@@ -1553,10 +1898,7 @@ function PanelZoomIntegration:displayCurrentPanel()
         end
         self:refreshPanelViewer(self._current_imgviewer)
         
-        -- Start preloading the next panel after a short delay
-        UIManager:scheduleIn(0.2, function()
-            self:preloadNextPanel()
-        end)
+        self:scheduleNextPanelPreload()
         return true
     end
     
@@ -1567,6 +1909,7 @@ function PanelZoomIntegration:displayCurrentPanel()
         fullscreen = true,
         buttons_visible = false,
         reading_direction = self:getEffectiveReadingDirection(),
+        basic_three_panel_mode = self.basic_three_panel_mode,
         custom_position = custom_position,  -- Pass custom position for center matching
         panel_screen_rect = panel_screen_rect,
         onTapRight = function() self:handleTapRight() end,
@@ -1581,6 +1924,9 @@ function PanelZoomIntegration:displayCurrentPanel()
                 self:switchToZoomMode()
             end
         end,
+        onToggleThreePanelMode = function()
+            self:setBasicThreePanelMode(not self.basic_three_panel_mode)
+        end,
     }
     
     self._current_imgviewer = panel_viewer
@@ -1591,15 +1937,18 @@ function PanelZoomIntegration:displayCurrentPanel()
     
     logger.info("DynamicPanelZoom: New PanelViewer shown")
     
-    -- Start preloading the next panel after a short delay
-    UIManager:scheduleIn(0.2, function()
-        self:preloadNextPanel()
-    end)
+    self:scheduleNextPanelPreload()
     
     return true -- Success, new viewer created
 end
 
 function PanelZoomIntegration:buildAdvancedOptionsMenu()
+    local function setStandardMargin(value)
+        self.standard_margin_percent = value
+        self:cancelPanelPreload()
+        self:refreshCurrentPanelIfActive()
+    end
+
     return {
         {
             text = _("Debug Logs"),
@@ -1621,8 +1970,12 @@ function PanelZoomIntegration:buildAdvancedOptionsMenu()
                         self.reading_direction_override = "ltr"
                         logger.info("DynamicPanelZoom: Reading direction override set to LTR")
                         self._panel_cache = {}
-                        self.current_panels = {}
-                        self:refreshCurrentPanelIfActive()
+                        self:cancelPanelPreload()
+                        if self._current_imgviewer and #self.current_panels > 0 then
+                            self:refreshCurrentPanelIfActive()
+                        else
+                            self:replaceCurrentPanels({})
+                        end
                     end,
                 },
                 {
@@ -1634,8 +1987,12 @@ function PanelZoomIntegration:buildAdvancedOptionsMenu()
                         self.reading_direction_override = "rtl"
                         logger.info("DynamicPanelZoom: Reading direction override set to RTL")
                         self._panel_cache = {}
-                        self.current_panels = {}
-                        self:refreshCurrentPanelIfActive()
+                        self:cancelPanelPreload()
+                        if self._current_imgviewer and #self.current_panels > 0 then
+                            self:refreshCurrentPanelIfActive()
+                        else
+                            self:replaceCurrentPanels({})
+                        end
                     end,
                 },
             },
@@ -1679,6 +2036,7 @@ function PanelZoomIntegration:buildAdvancedOptionsMenu()
                     checked_func = function() return self.show_adjacent_panels end,
                     callback = function()
                         self.show_adjacent_panels = not self.show_adjacent_panels
+                        self:cancelPanelPreload()
                         self:refreshCurrentPanelIfActive()
                     end,
                 },
@@ -1688,22 +2046,22 @@ function PanelZoomIntegration:buildAdvancedOptionsMenu()
                         {
                             text = _("0% (None)"),
                             checked_func = function() return self.standard_margin_percent == 0.0 end,
-                            callback = function() self.standard_margin_percent = 0.0 end,
+                            callback = function() setStandardMargin(0.0) end,
                         },
                         {
                             text = _("2% (Tight)"),
                             checked_func = function() return self.standard_margin_percent == 0.02 end,
-                            callback = function() self.standard_margin_percent = 0.02 end,
+                            callback = function() setStandardMargin(0.02) end,
                         },
                         {
                             text = _("5% (Normal)"),
                             checked_func = function() return self.standard_margin_percent == 0.05 end,
-                            callback = function() self.standard_margin_percent = 0.05 end,
+                            callback = function() setStandardMargin(0.05) end,
                         },
                         {
                             text = _("10% (Wide)"),
                             checked_func = function() return self.standard_margin_percent == 0.10 end,
-                            callback = function() self.standard_margin_percent = 0.10 end,
+                            callback = function() setStandardMargin(0.10) end,
                         },
                     },
                 },
@@ -1800,6 +2158,8 @@ function PanelZoomIntegration:buildHowToUseMenu()
         helpRow(_("Previous panel: tap the back side.")),
         helpRow(_("After last panel: tap forward for next page.")),
         helpRow(_("Before first panel: tap back for previous page."), true),
+        helpRow(_("Basic mode: trimmed overview, then 4 detailed views."), true),
+        helpRow(_("Tap the bottom-left icon to toggle Basic mode."), true),
         helpRow(_("Free zoom: long-press while viewing a panel.")),
         helpRow(_("If taps feel reversed, adjust direction.")),
         helpRow(_("Or adjust the next panel tap zone."), true),
@@ -1822,6 +2182,13 @@ function PanelZoomIntegration:buildPanelZoomMenu()
             checked_func = function() return self.plugin_enabled end,
             callback = function()
                 self:setPluginEnabled(not self.plugin_enabled)
+            end,
+        },
+        {
+            text = _("Basic 4 Panels Mode"),
+            checked_func = function() return self.basic_three_panel_mode end,
+            callback = function()
+                self:setBasicThreePanelMode(not self.basic_three_panel_mode)
             end,
             separator = true,
         },

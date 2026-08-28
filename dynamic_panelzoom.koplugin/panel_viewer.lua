@@ -10,12 +10,18 @@ local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
+local IconWidget = require("ui/widget/iconwidget")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local RenderImage = require("ui/renderimage")
 local Screen = require("device").screen
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local _ = require("gettext")
+
+local THREE_PANEL_ICON_SIZE = Screen:scaleBySize(34)
+local THREE_PANEL_BUTTON_PADDING = Screen:scaleBySize(7)
+local THREE_PANEL_BUTTON_MARGIN = Screen:scaleBySize(8)
+local THREE_PANEL_BUTTON_BORDER = math.max(2, Screen:scaleBySize(1))
 
 local PanelViewer = InputContainer:extend{
     -- Core properties
@@ -39,6 +45,8 @@ local PanelViewer = InputContainer:extend{
     onPrev = nil,
     onClose = nil,
     onHold = nil,
+    onToggleThreePanelMode = nil,
+    basic_three_panel_mode = false,
     
     -- Internal state
     _image_bb = nil,
@@ -76,6 +84,12 @@ function PanelViewer:init()
     if self.panel_screen_rect then
         self._panel_screen_rect = copyGeom(self.panel_screen_rect)
     end
+
+    self._three_panel_icon = IconWidget:new{
+        icon = "zoom.row",
+        width = THREE_PANEL_ICON_SIZE,
+        height = THREE_PANEL_ICON_SIZE,
+    }
     
     logger.info(string.format("PanelViewer: Initialized with image %dx%d", 
         self._rendered_size and self._rendered_size.w or 0,
@@ -206,6 +220,12 @@ end
 
 function PanelViewer:onTap(_, ges)
     if not ges or not ges.pos then return false end
+
+    if self:isThreePanelTogglePosition(ges.pos) then
+        logger.info("PanelViewer: Basic 4 Panels Mode shortcut tapped")
+        self.onToggleThreePanelMode()
+        return true
+    end
     
     local screen_w = Screen:getWidth()
     local x_pct = ges.pos.x / screen_w
@@ -227,6 +247,7 @@ function PanelViewer:onTap(_, ges)
 end
 
 function PanelViewer:onHold(_, ges)
+    if ges and self:isThreePanelTogglePosition(ges.pos) then return true end
     logger.info("PanelViewer: Hold gesture detected, triggering zoom mode")
     if self.onHold then self.onHold() end
     return true
@@ -282,7 +303,47 @@ function PanelViewer:paintTo(bb, x, y)
         bb:blitFrom(self._scaled_image_bb, screen_rect.x, screen_rect.y, 0, 0, screen_rect.w, screen_rect.h)
     end
 
+    if self._three_panel_icon and self.onToggleThreePanelMode then
+        local rect = self:getThreePanelToggleRect()
+        bb:paintRect(rect.x, rect.y, rect.w, rect.h, Blitbuffer.COLOR_WHITE)
+        if self.basic_three_panel_mode then
+            bb:paintRect(
+                rect.x + THREE_PANEL_BUTTON_BORDER,
+                rect.y + THREE_PANEL_BUTTON_BORDER,
+                rect.w - 2 * THREE_PANEL_BUTTON_BORDER,
+                rect.h - 2 * THREE_PANEL_BUTTON_BORDER,
+                Blitbuffer.COLOR_BLACK)
+            self._three_panel_icon.invert = true
+        else
+            bb:paintBorder(
+                rect.x, rect.y, rect.w, rect.h,
+                THREE_PANEL_BUTTON_BORDER, Blitbuffer.COLOR_BLACK)
+            self._three_panel_icon.invert = false
+        end
+        self._three_panel_icon:paintTo(
+            bb,
+            rect.x + THREE_PANEL_BUTTON_PADDING,
+            rect.y + THREE_PANEL_BUTTON_PADDING)
+    end
+
     self._is_dirty = false
+end
+
+function PanelViewer:getThreePanelToggleRect()
+    local size = THREE_PANEL_ICON_SIZE + 2 * THREE_PANEL_BUTTON_PADDING
+    return {
+        x = THREE_PANEL_BUTTON_MARGIN,
+        y = Screen:getHeight() - THREE_PANEL_BUTTON_MARGIN - size,
+        w = size,
+        h = size,
+    }
+end
+
+function PanelViewer:isThreePanelTogglePosition(pos)
+    if not pos or not self.onToggleThreePanelMode then return false end
+    local rect = self:getThreePanelToggleRect()
+    return pos.x >= rect.x and pos.x < rect.x + rect.w
+        and pos.y >= rect.y and pos.y < rect.y + rect.h
 end
 
 local function unionRects(a, b)
@@ -405,6 +466,11 @@ function PanelViewer:updateReadingDirection(direction)
     logger.info(string.format("PanelViewer: Reading direction set to %s", self.reading_direction))
 end
 
+function PanelViewer:updateBasicThreePanelMode(enabled)
+    self.basic_three_panel_mode = enabled == true
+    self._is_dirty = true
+end
+
 function PanelViewer:updateCustomPosition(custom_position)
     self:rememberDisplayRect()
     self.custom_position = custom_position
@@ -482,6 +548,10 @@ function PanelViewer:freeResources()
     self._previous_panel_screen_rect = nil
     self._clear_only = false
     self._clear_luma = 255
+    if self._three_panel_icon and self._three_panel_icon.free then
+        self._three_panel_icon:free()
+    end
+    self._three_panel_icon = nil
     logger.info("PanelViewer: Resources freed")
 end
 

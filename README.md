@@ -1,33 +1,43 @@
 # Advanced Panel Zoom Plugin
 
-Automatic panel-by-panel reading for BD, comics, and manga in KOReader.
+Automatic panel-by-panel reading for western BD, comics, and manga in KOReader.
 
-This plugin detects panels directly from the rendered page and opens them one at a time in a full-screen panel viewer. It is designed for comfortable comic reading on e-ink devices, especially colour Kobo devices.
+The plugin detects panels directly from the rendered page and displays them one
+at a time in a full-screen viewer. It also provides a reliable four-view mode
+for splash pages and layouts that cannot be segmented confidently.
+
+Current version: `2.1.0`
 
 ## Difference From the Original
 
-The original project by JorgeTheFox introduced the dynamic panel zoom foundation.
-This fork keeps that idea, but shifts the focus to a Kobo Clara Colour optimized
-reading experience for comics, manga, and especially western Bandes dessinees.
+The original project by JorgeTheFox introduced the dynamic panel zoom
+foundation. This fork keeps that idea while focusing on a Kobo Clara Colour
+reading experience, especially for western BD and irregular comic layouts.
 
 The main differences are:
 
-- panel detection tuned against real Kobo Clara Colour device pixels
-- fixes for high-DPI rendered pages, colour dithering, and device refresh behavior
+- panel detection tuned against real Kobo Clara Colour render pixels
+- fixes for high-DPI bitmap handling, colour dithering, and device rendering
+- deterministic left-to-right and right-to-left panel ordering
+- confidence validation that rejects invalid, duplicated, or unstable layouts
+- automatic trimmed overview plus four detailed views when detection is not reliable
+- manually selectable Basic 4 Panels Mode for complex pages
+- bottom-left in-view shortcut for toggling Basic 4 Panels Mode
+- screen-filling detail views with horizontal and vertical border trimming
 - advanced e-ink ghosting/remanence cleanup during panel transitions
-- improved handling of western BD layouts and irregular comic panels
-- KOReader defaults applied automatically for this reading mode
-- cleaned KOReader menu with activation, help, debug, and reading controls
-- debug diagnostics kept in KOReader's `crash.log` instead of sidecar files
+- guarded next-panel preloading that cannot be reused on the wrong page
+- KOReader reading defaults applied automatically
+- integrated help, activation, reading, zoom, and debug controls
+- diagnostics written only to KOReader's `crash.log`
 
 ## Tested Device
 
-This plugin has been tested and optimized for:
+The plugin has been tested and optimized for:
 
 - Kobo Clara Colour
 - Kobo G2 colour profile
 
-When active, the plugin applies these KOReader defaults:
+When active, it applies these KOReader defaults:
 
 - Rotation: landscape
 - Page crop: none
@@ -36,18 +46,23 @@ When active, the plugin applies these KOReader defaults:
 - Contrast: 2
 - Dithering: on
 
-Other KOReader devices may work, but the tuning and refresh behavior were built around the Kobo Clara Colour.
+Other KOReader devices may work, but panel tuning and refresh behavior were
+built around the Kobo Clara Colour.
 
 ## Features
 
-- Automatic panel detection, no external panel JSON required
+- Dynamic panel detection without external panel JSON files
+- Automatic fallback for uncertain or invalid layouts
+- Optional Basic 4 Panels Mode for every page
 - Full-screen panel-by-panel navigation
-- Left-to-right and right-to-left reading direction
-- Configurable next-panel tap zone
-- Optional adjacent page content around panels
-- Hold-to-zoom/free zoom mode
-- Optional debug logs and analysis bitmap dumps into `crash.log`
-- No separate debug sidecar files by default
+- Deterministic LTR and RTL reading order
+- Configurable next-panel tap side
+- Optional adjacent-page context and panel padding
+- Hold-to-zoom using KOReader's native image viewer
+- Guarded one-panel lookahead for faster transitions
+- Full-screen e-ink cleanup to prevent ghosting and remanence
+- Optional detector logs and exact analysis bitmap dumps in `crash.log`
+- No diagnostic sidecar files
 
 ## Installation
 
@@ -57,7 +72,7 @@ Copy the plugin folder to KOReader's plugin directory:
 .adds/koreader/plugins/dynamic_panelzoom.koplugin
 ```
 
-The folder should contain at least:
+The folder must contain:
 
 ```text
 _meta.lua
@@ -66,41 +81,59 @@ panel_detect.lua
 panel_viewer.lua
 ```
 
-Restart KOReader after copying the plugin.
+Restart KOReader after installing or updating the plugin.
 
 ## Basic Use
 
-1. Open a comic, manga, BD, CBZ, PDF, or other page-based document.
-2. Long-press a panel on the page to start panel selection.
-3. Tap the forward side to show the next panel.
-4. Tap the back side to show the previous panel.
-5. After the last panel, tap forward to go to the next page.
-6. Before the first panel, tap back to go to the previous page.
-7. While viewing a selected panel, long-press to enter free zoom, if enabled.
+1. Open a CBZ, PDF, DjVu, or another page-based comic document.
+2. Long-press a panel on the page to start panel viewing.
+3. Tap the forward side to display the next panel.
+4. Tap the back side to display the previous panel.
+5. Tap forward after the last panel to move to the next page.
+6. Tap back before the first panel to move to the previous page.
+7. Tap the center of the screen to close panel viewing.
+8. Long-press while viewing a panel to open free zoom, when enabled.
 
-If taps feel reversed, adjust **Reading direction** or **Next panel tap zone** in the plugin menu.
+If taps feel reversed, adjust **Reading direction** or **Next panel tap zone**.
+
+## Four-Panel Behavior
+
+When only one large image is detected, or when dynamic detection is not
+structurally reliable, the page is shown as:
+
+1. one overview trimmed to the detected artwork bounds;
+2. four screen-filling detailed views.
+
+The detailed views use the detected artwork bounds on all four sides. Their
+crop matches the Kobo screen aspect, removing outer white space horizontally
+and vertically. Portrait pages are swept from top to bottom; wide pages are
+swept horizontally in the configured reading direction.
+
+Enable **Basic 4 Panels Mode** to force this sequence on every page and bypass
+dynamic panel segmentation. This is useful when a complex layout interrupts
+reading. It can also be toggled from the bottom-left icon while viewing a
+panel. The option is off by default and is retained across restarts.
 
 ## KOReader Menu
 
-The plugin is integrated into KOReader's panel zoom menu:
-
-```text
-Advanced Panel Zoom Plugin
-```
-
-Menu structure:
+The plugin replaces KOReader's panel zoom submenu with:
 
 ```text
 Advanced Panel Zoom Plugin
 +-- Activate Plugin
++-- Basic 4 Panels Mode
 +-- How to use
 +-- Advanced Options
     +-- Debug Logs
     +-- Reading direction
     +-- Next panel tap zone
     +-- Standard panel settings
+    |   +-- Show adjacent page content
+    |   +-- Padding around panel
     +-- Hold-to-zoom settings
     |   +-- Allow panel Zoom
+    |   +-- Hold-to-Zoom padding
+    |   +-- Initial zoom level
     +-- Fall back to text selection
 ```
 
@@ -108,24 +141,29 @@ Advanced Panel Zoom Plugin
 
 ### Activate Plugin
 
-Turns the plugin on or off. It is enabled by default.
+Turns dynamic panel handling on or off. It is enabled by default.
+
+### Basic 4 Panels Mode
+
+Bypasses dynamic segmentation and displays every page as a trimmed overview
+followed by four screen-filling detailed views.
 
 ### How to use
 
-Shows short usage instructions directly inside the KOReader menu.
+Shows short navigation instructions and the recommended Kobo settings directly
+inside the KOReader menu.
 
 ### Debug Logs
 
-Off by default.
+Off by default. When enabled, it turns on both:
 
-When enabled, this turns on both:
+- verbose detector diagnostics;
+- base64-embedded analysis bitmap dumps.
 
-- verbose panel detection logs
-- embedded analysis bitmap dumps
+All output goes to KOReader's `crash.log`. Bitmap dumping is intentionally
+verbose and can make first-time page analysis noticeably slower.
 
-All debug output goes into KOReader's `crash.log`.
-
-The plugin should not create separate files such as:
+The plugin does not create files such as:
 
 ```text
 panelzoom.log
@@ -135,40 +173,37 @@ panelzoom_dump.log
 
 ### Reading direction
 
-Controls panel order:
-
-- Left-to-right
-- Right-to-left
+Selects deterministic Left-to-Right or Right-to-Left panel order.
 
 ### Next panel tap zone
 
-Controls which side of the screen advances to the next panel:
-
-- Auto, based on reading direction
-- Left side
-- Right side
+Selects Auto, Left side, or Right side as the forward navigation area.
 
 ### Standard panel settings
 
-Controls normal panel display behavior, including adjacent page content and padding around panels.
+Controls adjacent-page context and padding around dynamically detected panels.
 
 ### Hold-to-zoom settings
 
-Controls the optional free zoom mode entered by long-pressing while viewing a selected panel.
+Controls whether a long press opens free zoom, its padding, and its initial
+zoom level.
 
 ### Fall back to text selection
 
-KOReader compatibility option. If enabled, failed panel zoom gestures may fall back to normal text selection.
+KOReader compatibility option. When enabled, a failed panel-zoom gesture may
+continue into normal text selection. It is normally unnecessary for
+image-based comics.
 
-For image-based comics, this is usually best left off.
+## Detection and Performance
 
-## Testing
-
-The local regression corpus used during tuning is not included in this public
-repository because it contains private/commercial comic pages.
-
-Before publishing a release, validate the plugin on-device with representative
-CBZ/PDF pages.
+- Pages are analyzed the first time panel viewing is opened.
+- Results are cached in memory for the current KOReader session.
+- The next panel is rendered ahead when possible.
+- Preloaded images are validated against the document, page, mode, direction,
+  layout, panel index, and active viewer before use.
+- Confident layouts use dynamic panels; stable large-panel layouts are kept;
+  invalid or unstable layouts use the four-view fallback.
+- E-ink cleanup prioritizes a ghost-free image and may produce a visible flash.
 
 ## Debugging Device Issues
 
@@ -178,16 +213,26 @@ Enable:
 Advanced Panel Zoom Plugin > Advanced Options > Debug Logs
 ```
 
-Then reproduce the issue on the device and collect KOReader's `crash.log`.
+Reproduce the issue, then collect KOReader's `crash.log`. Disable debug logging
+for normal reading performance.
 
-Debug output is intended for development and issue reports.
+## Testing
 
-## Notes
+The detector is regression-tested under LuaJIT against Kobo-like rendered
+pixels, old and current fixture sets, deterministic LTR/RTL ordering, layout
+confidence, and exact device bitmap captures.
 
-- The plugin is intended for page-based documents.
-- It is not tuned for scrolling EPUB-style documents.
-- Some unusual page layouts may still require fallback behavior or manual reading.
-- The detector favors stable panel reading over aggressive splitting.
+The local image corpus is not included in the public repository because it
+contains private or commercial comic pages. Releases should also be validated
+on a physical Kobo with representative CBZ and PDF documents.
+
+## Compatibility Notes
+
+- Intended for page-based documents, including CBZ, PDF, and DjVu.
+- Not intended for scrolling EPUB-style documents.
+- Detection is deliberately conservative when layout confidence is low.
+- Manual Basic 4 Panels Mode remains available for unsupported page designs.
+- Refresh tuning is specific to e-ink and especially Kobo Clara Colour.
 
 ## Credits & License
 
@@ -195,4 +240,5 @@ This project is a fork of the original dynamic panel zoom work by JorgeTheFox.
 
 Thanks to JorgeTheFox for the original plugin foundation and idea.
 
-Licensed under the MIT License, matching the upstream project. If you redistribute or modify this plugin, keep appropriate attribution.
+Licensed under the MIT License, matching the upstream project. Redistributed or
+modified versions should retain appropriate attribution.
