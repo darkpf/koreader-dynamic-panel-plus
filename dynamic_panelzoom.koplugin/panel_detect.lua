@@ -19,7 +19,7 @@ Coordinate conventions:
 ]]
 
 local PanelDetect = {
-    VERSION = "1.0",
+    VERSION = "2.1",
 }
 
 local DEFAULTS = {

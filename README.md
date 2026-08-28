@@ -49,6 +49,37 @@ When active, it applies these KOReader defaults:
 Other KOReader devices may work, but panel tuning and refresh behavior were
 built around the Kobo Clara Colour.
 
+## Side Effects You Should Know About
+
+The plugin changes two things outside its own feature set. Both are deliberate,
+but neither is obvious from the menu.
+
+### It writes KOReader's global defaults
+
+The reading defaults listed above are written to KOReader's global settings the
+first time a page-based document is opened with the plugin enabled, not only to
+the current document. They therefore become the defaults for every document you
+open afterwards, including ordinary text books.
+
+The settings written globally are rotation mode, page crop, zoom mode genus and
+type, page scroll and contrast, plus hardware or software dithering depending on
+the device.
+
+Disabling the plugin does not restore your previous values. If you want them
+back, change them yourself in KOReader before or after using the plugin.
+
+### It blocks OCR while active
+
+While the plugin is enabled, KOReader's OCR text handler is replaced with a
+no-op and the OCR menu entries are disabled. This prevents a long press from
+starting OCR instead of panel viewing.
+
+OCR is restored as soon as the plugin is deactivated from:
+
+```text
+Advanced Panel Zoom Plugin > Activate Plugin
+```
+
 ## Features
 
 - Dynamic panel detection without external panel JSON files
