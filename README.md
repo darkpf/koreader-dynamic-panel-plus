@@ -268,8 +268,15 @@ on a physical Kobo with representative CBZ and PDF documents.
 ## Credits & License
 
 This project is a fork of the original dynamic panel zoom work by JorgeTheFox.
-
 Thanks to JorgeTheFox for the original plugin foundation and idea.
+https://github.com/JorgeTheFox/koreader-dynamic-panelzoom
+
+Thanks to notmarek for his solution to migrate Tolino to Kobo software 
+https://github.com/notmarek/KoboTolinoFindings
+
+Thanks to KOreader for their amazing open source ereader allowing openly plugins
+https://github.com/koreader/koreader
 
 Licensed under the MIT License, matching the upstream project. Redistributed or
 modified versions should retain appropriate attribution.
+
